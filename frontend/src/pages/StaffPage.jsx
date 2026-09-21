@@ -1,10 +1,89 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import Layout from "../components/Layout";
 
-const BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8080";
-const API_BASE = `${BASE_URL}/Backend/models/staff`;
+// ====================================================
+// Persistence (เชื่อม JSON เดียวกับ GasPage ผ่าน /api/data)
+//   - อ่าน/เขียนไฟล์จริงผ่าน Vite API -> /api/data
+//   - เก็บสำเนาใน localStorage (offline fallback)
+// ====================================================
+const DB_KEY = "gas_system_db_v1";
+const API_URL = "/api/data";
 
-// ฟังก์ชันสำหรับลบอิโมจิและสัญลักษณ์พิเศษออกจากข้อความ
+const clone = (obj) => JSON.parse(JSON.stringify(obj));
+
+const emptyDb = () => ({
+  tables: {
+    gas_cylinder: [],
+    delivery: [],
+    customer: [],
+    delivery_staff: [],
+  },
+});
+
+const normalizeDb = (d) => {
+  const out = d && typeof d === "object" ? d : emptyDb();
+  if (!out.tables) out.tables = {};
+  if (!Array.isArray(out.tables.gas_cylinder)) out.tables.gas_cylinder = [];
+  if (!Array.isArray(out.tables.delivery)) out.tables.delivery = [];
+  if (!Array.isArray(out.tables.customer)) out.tables.customer = [];
+  if (!Array.isArray(out.tables.delivery_staff)) out.tables.delivery_staff = [];
+  return out;
+};
+
+// ---------- localStorage ----------
+const loadLocalDb = () => {
+  try {
+    const raw = localStorage.getItem(DB_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.tables) return parsed;
+    }
+  } catch (e) {
+    console.warn("loadLocalDb error:", e);
+  }
+  return null;
+};
+const saveLocalDb = (db) => {
+  try {
+    localStorage.setItem(DB_KEY, JSON.stringify(db));
+  } catch (e) {
+    console.warn("saveLocalDb error:", e);
+  }
+};
+
+// ---------- API ----------
+const fetchFileDb = async () => {
+  const res = await fetch(API_URL, { cache: "no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+};
+const writeFileDb = async (db) => {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(db),
+  });
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const j = await res.json();
+      if (j?.error) msg = j.error;
+    } catch (_) {}
+    throw new Error(msg);
+  }
+  return res.json();
+};
+
+// ---------- ID generator ----------
+const genStaffId = (list) => {
+  const nums = list
+    .map((s) => parseInt(String(s.staff_id || "").replace(/\D/g, ""), 10))
+    .filter((n) => !isNaN(n));
+  const next = (nums.length ? Math.max(...nums) : 0) + 1;
+  return `STF${String(next).padStart(3, "0")}`;
+};
+
+// ---------- Utils ----------
 const removeEmojis = (text) => {
   if (!text) return "";
   return String(text)
@@ -15,12 +94,22 @@ const removeEmojis = (text) => {
     .trim();
 };
 
+// ====================================================
+// Component
+// ====================================================
 function StaffPage() {
-  const [staffs, setStaffs] = useState([]);
+  const [db, setDb] = useState(null);
   const [loading, setLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [editingStaffId, setEditingStaffId] = useState(null);
   const [message, setMessage] = useState({ type: "", text: "" });
+
+  const [apiAvailable, setApiAvailable] = useState(true);
+  const [syncStatus, setSyncStatus] = useState("idle");
+
+  const loadedDbRef = useRef(null);
+  const pendingSaveRef = useRef(null);
+  const saveInFlightRef = useRef(false);
 
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
@@ -34,34 +123,95 @@ function StaffPage() {
     status: "active",
   });
 
-  const [selectedStaff, setSelectedStaff] = useState(1);
-  const [period, setPeriod] = useState("day");
-  const [history, setHistory] = useState([]);
-  const [summary, setSummary] = useState(0);
-
+  // ---------- Load on mount ----------
   useEffect(() => {
-    const fetchHistory = async () => {
+    let cancelled = false;
+    (async () => {
       try {
-        const res = await fetch(
-          `${BASE_URL}/Backend/models/history.php?staff_id=${selectedStaff}&period=${period}`
-        );
-        if (!res.ok) throw new Error("Network response was not ok");
-        
-        const data = await res.json();
-        if (data.success) {
-          setHistory(data.data);
-          setSummary(data.total_completed);
-        }
+        const fileDb = await fetchFileDb();
+        if (cancelled) return;
+        if (!fileDb || !fileDb.tables) throw new Error("Data.json ไม่ถูกรูปแบบ");
+        const norm = normalizeDb(fileDb);
+        loadedDbRef.current = norm;
+        setDb(norm);
+        setApiAvailable(true);
       } catch (err) {
-        console.error("Fetch history error:", err);
+        console.warn("โหลดจาก /api/data ไม่ได้ -> ใช้ localStorage:", err);
+        if (cancelled) return;
+        setApiAvailable(false);
+        setSyncStatus("offline");
+        const local = loadLocalDb();
+        if (local?.tables) {
+          const norm = normalizeDb(local);
+          loadedDbRef.current = norm;
+          setDb(norm);
+        } else {
+          const norm = emptyDb();
+          loadedDbRef.current = norm;
+          setDb(norm);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // ---------- Persist to localStorage ----------
+  useEffect(() => {
+    if (db) saveLocalDb(db);
+  }, [db]);
+
+  // ---------- Realtime auto-save ----------
+  useEffect(() => {
+    if (!db || loading) return;
+    if (db === loadedDbRef.current) return;
+    if (!apiAvailable) return;
+
+    pendingSaveRef.current = db;
+
+    const drain = async () => {
+      if (saveInFlightRef.current) return;
+      saveInFlightRef.current = true;
+      setSyncStatus("saving");
+      try {
+        while (pendingSaveRef.current) {
+          const toSave = pendingSaveRef.current;
+          pendingSaveRef.current = null;
+          await writeFileDb(toSave);
+        }
+        setSyncStatus("saved");
+        setTimeout(() => setSyncStatus("idle"), 1500);
+      } catch (err) {
+        console.error("Auto-save failed:", err);
+        setSyncStatus("error");
+      } finally {
+        saveInFlightRef.current = false;
+        if (pendingSaveRef.current) drain();
       }
     };
 
-    if (selectedStaff) {
-      fetchHistory();
-    }
-  }, [selectedStaff, period]);
+    drain();
+  }, [db, loading, apiAvailable]);
 
+  // ---------- Flush before unload ----------
+  useEffect(() => {
+    const flush = () => {
+      if (!pendingSaveRef.current || !apiAvailable) return;
+      try {
+        const blob = new Blob([JSON.stringify(pendingSaveRef.current)], {
+          type: "application/json",
+        });
+        navigator.sendBeacon?.(API_URL, blob);
+      } catch (_) {}
+    };
+    window.addEventListener("beforeunload", flush);
+    return () => window.removeEventListener("beforeunload", flush);
+  }, [apiAvailable]);
+
+  // ---------- Auto-hide message ----------
   useEffect(() => {
     if (message.text) {
       const timer = setTimeout(() => setMessage({ type: "", text: "" }), 5000);
@@ -69,47 +219,43 @@ function StaffPage() {
     }
   }, [message]);
 
+  // ---------- Update helper ----------
+  const updateDb = (updater) => {
+    setDb((prev) => {
+      const next = clone(prev || emptyDb());
+      updater(next);
+      return next;
+    });
+  };
+
+  // ====================================================
+  // Derived data
+  // ====================================================
+  const tables = db?.tables || {};
+  const staffs = tables.delivery_staff || [];
+  const deliveries = tables.delivery || [];
+
+  // นับ pending/delivering jobs ต่อพนักงาน (คำนวณจาก delivery table)
+  const staffJobCounts = useMemo(() => {
+    const counts = {};
+    deliveries.forEach((d) => {
+      const sid = String(d.staff_id ?? d.staffId ?? "").trim();
+      if (!sid) return;
+      const status = (d.status || "").toLowerCase();
+      if (status === "pending" || status === "delivering") {
+        counts[sid] = (counts[sid] || 0) + 1;
+      }
+    });
+    return counts;
+  }, [deliveries]);
+
+  // ====================================================
+  // Validation
+  // ====================================================
   const validatePhone = (phone) => {
     const phoneRegex = /^[0-9]{9,10}$/;
     return phoneRegex.test(phone.replace(/[-\s]/g, ""));
   };
-
-  const fetchStaffs = async () => {
-    try {
-      setLoading(true);
-      const res = await fetch(`${API_BASE}/list.php`);
-      
-      // อ่านค่าตอบกลับเป็น Text ก่อนเพื่อป้องกัน Crash
-      const text = await res.text();
-      let data;
-      
-      try {
-        data = JSON.parse(text);
-      } catch (jsonErr) {
-        console.error("PHP Error Output:", text);
-        setMessage({ 
-          type: "error", 
-          text: "Server ตอบกลับไม่ถูกต้อง (มี PHP Error ดูรายละเอียดใน Console)" 
-        });
-        return;
-      }
-
-      if (data.success) {
-        setStaffs(data.data);
-      } else {
-        setMessage({ type: "error", text: data.message || "โหลดข้อมูลไม่สำเร็จ" });
-      }
-    } catch (err) {
-      console.error(err);
-      setMessage({ type: "error", text: "เกิดข้อผิดพลาดในการเชื่อมต่อ" });
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchStaffs();
-  }, []);
 
   const validateForm = () => {
     if (!formData.staff_name.trim()) {
@@ -121,7 +267,10 @@ function StaffPage() {
       return false;
     }
     if (!validatePhone(formData.staff_phone)) {
-      setMessage({ type: "error", text: "กรุณากรอกเบอร์โทรให้ถูกต้อง (ตัวเลข 9-10 หลัก)" });
+      setMessage({
+        type: "error",
+        text: "กรุณากรอกเบอร์โทรให้ถูกต้อง (ตัวเลข 9-10 หลัก)",
+      });
       return false;
     }
     if (!formData.username.trim()) {
@@ -129,11 +278,21 @@ function StaffPage() {
       return false;
     }
     if (!editingStaffId && formData.password.trim().length < 4) {
-      setMessage({ type: "error", text: "รหัสผ่านต้องมีความยาวอย่างน้อย 4 ตัวอักษร" });
+      setMessage({
+        type: "error",
+        text: "รหัสผ่านต้องมีความยาวอย่างน้อย 4 ตัวอักษร",
+      });
       return false;
     }
-    if (editingStaffId && formData.password.trim() && formData.password.trim().length < 4) {
-      setMessage({ type: "error", text: "รหัสผ่านต้องมีความยาวอย่างน้อย 4 ตัวอักษร" });
+    if (
+      editingStaffId &&
+      formData.password.trim() &&
+      formData.password.trim().length < 4
+    ) {
+      setMessage({
+        type: "error",
+        text: "รหัสผ่านต้องมีความยาวอย่างน้อย 4 ตัวอักษร",
+      });
       return false;
     }
     return true;
@@ -152,14 +311,12 @@ function StaffPage() {
     setMessage({ type: "", text: "" });
   };
 
-  const saveStaff = async (e) => {
+  // ====================================================
+  // Save staff
+  // ====================================================
+  const saveStaff = (e) => {
     if (e) e.preventDefault();
     if (!validateForm()) return;
-
-    setIsSubmitting(true);
-    const url = editingStaffId
-      ? `${API_BASE}/update_staff.php`
-      : `${API_BASE}/create_staff.php`;
 
     const payload = {
       staff_name: formData.staff_name.trim(),
@@ -168,56 +325,80 @@ function StaffPage() {
       address: formData.address.trim(),
       status: formData.status,
     };
-
-    if (editingStaffId) {
-      payload.staff_id = editingStaffId;
-    }
-
     if (formData.password.trim() !== "") {
       payload.password = formData.password.trim();
     }
 
+    setIsSubmitting(true);
     try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      if (editingStaffId) {
+        // แก้ไข
+        const dup = staffs.some(
+          (s) =>
+            s.staff_id !== editingStaffId &&
+            String(s.username || "").trim() === payload.username
+        );
+        if (dup) {
+          setMessage({ type: "error", text: "Username นี้ถูกใช้งานแล้ว" });
+          setIsSubmitting(false);
+          return;
+        }
 
-      const text = await res.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch (e) {
-        console.error("JSON Parse Error:", text);
-        setMessage({ type: "error", text: "Server error: " + text.substring(0, 100) });
-        return;
-      }
-
-      if (data.success) {
-        setMessage({
-          type: "success",
-          text: editingStaffId ? "แก้ไขข้อมูลพนักงานสำเร็จ" : "เพิ่มพนักงานสำเร็จ",
+        updateDb((draft) => {
+          const list = draft.tables.delivery_staff || [];
+          const idx = list.findIndex((s) => s.staff_id === editingStaffId);
+          if (idx >= 0) {
+            const updated = {
+              ...list[idx],
+              ...payload,
+              updated_at: new Date().toISOString(),
+            };
+            if (!payload.password) delete updated.password_updated_marker;
+            list[idx] = updated;
+          }
         });
-        await fetchStaffs();
+
+        setMessage({ type: "success", text: "แก้ไขข้อมูลพนักงานสำเร็จ" });
         clearForm();
       } else {
-        setMessage({ type: "error", text: data.message || "บันทึกไม่สำเร็จ" });
+        // เพิ่มใหม่
+        const dup = staffs.some(
+          (s) => String(s.username || "").trim() === payload.username
+        );
+        if (dup) {
+          setMessage({ type: "error", text: "Username นี้ถูกใช้งานแล้ว" });
+          setIsSubmitting(false);
+          return;
+        }
+
+        updateDb((draft) => {
+          const list = draft.tables.delivery_staff || [];
+          const now = new Date().toISOString();
+          list.push({
+            staff_id: genStaffId(list),
+            ...payload,
+            created_at: now,
+            updated_at: now,
+          });
+        });
+
+        setMessage({ type: "success", text: "เพิ่มพนักงานสำเร็จ" });
+        clearForm();
       }
-    } catch (err) {
-      console.error(err);
-      setMessage({ type: "error", text: "เกิดข้อผิดพลาดในการเชื่อมต่อ: " + err.message });
     } finally {
       setIsSubmitting(false);
     }
   };
 
+  // ====================================================
+  // Edit / Delete
+  // ====================================================
   const editStaff = (staff) => {
     setFormData({
       staff_name: staff.staff_name || "",
       staff_phone: staff.staff_phone || "",
       username: staff.username || "",
-      password: staff.password && staff.password.startsWith("$2y$") ? "" : (staff.password || ""),
+      password: "",
       address: staff.address || "",
       status: staff.status || "active",
     });
@@ -225,37 +406,28 @@ function StaffPage() {
     setMessage({ type: "", text: "" });
   };
 
-  const deleteStaff = async (staffId, staffName) => {
+  const deleteStaff = (staffId, staffName) => {
     if (!window.confirm(`ยืนยันลบพนักงาน "${staffName}"?`)) return;
 
-    try {
-      const res = await fetch(`${API_BASE}/delete_staff.php`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ staff_id: staffId }),
-      });
-      const data = await res.json();
+    updateDb((draft) => {
+      draft.tables.delivery_staff = (draft.tables.delivery_staff || []).filter(
+        (s) => s.staff_id !== staffId
+      );
+    });
 
-      if (data.success) {
-        setMessage({ type: "success", text: "ลบพนักงานสำเร็จ" });
-        await fetchStaffs();
-        if (editingStaffId === staffId) clearForm();
-      } else {
-        setMessage({ type: "error", text: data.message || "ลบไม่สำเร็จ" });
-      }
-    } catch (err) {
-      console.error(err);
-      setMessage({ type: "error", text: "เกิดข้อผิดพลาดในการเชื่อมต่อ" });
-    }
+    setMessage({ type: "success", text: "ลบพนักงานสำเร็จ" });
+    if (editingStaffId === staffId) clearForm();
   };
 
+  // ====================================================
+  // Filter
+  // ====================================================
   const filteredStaffs = staffs.filter((staff) => {
     const term = searchTerm.toLowerCase().trim();
     const matchesSearch =
       (staff.staff_name && staff.staff_name.toLowerCase().includes(term)) ||
       (staff.staff_phone && staff.staff_phone.includes(term)) ||
       (staff.username && staff.username.toLowerCase().includes(term)) ||
-      (staff.password && staff.password.toLowerCase().includes(term)) ||
       (staff.address && staff.address.toLowerCase().includes(term));
 
     const matchesStatus =
@@ -264,11 +436,23 @@ function StaffPage() {
     return matchesSearch && matchesStatus;
   });
 
+  // ---------- Sync label ----------
+  const syncLabel = () => {
+    if (!apiAvailable) return "⚠️ โหมดออฟไลน์ (บันทึกลง localStorage)";
+    if (syncStatus === "saving") return "⏳ กำลังบันทึก Data.json...";
+    if (syncStatus === "saved") return "✅ บันทึก Data.json แล้ว";
+    if (syncStatus === "error") return "❌ บันทึกไม่สำเร็จ";
+    return "(realtime auto-sync)";
+  };
+
+  // ====================================================
+  // Render
+  // ====================================================
   if (loading) {
     return (
       <Layout>
         <div style={{ color: "white", textAlign: "center", padding: "50px" }}>
-          กำลังโหลดข้อมูล...
+          ⏳ กำลังโหลดข้อมูลจาก Data.json...
         </div>
       </Layout>
     );
@@ -276,7 +460,26 @@ function StaffPage() {
 
   return (
     <Layout>
-      <h1 style={{ marginBottom: "20px", color: "white" }}>จัดการพนักงานส่ง</h1>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          flexWrap: "wrap",
+          gap: "10px",
+          marginBottom: "20px",
+        }}
+      >
+        <h1 style={{ margin: 0, color: "white" }}>จัดการพนักงานส่ง</h1>
+        <span
+          style={{
+            color: apiAvailable ? "#22c55e" : "#f59e0b",
+            fontSize: "12px",
+          }}
+        >
+          {syncLabel()}
+        </span>
+      </div>
 
       {message.text && (
         <div
@@ -298,13 +501,15 @@ function StaffPage() {
         <h2 style={{ marginTop: 0, color: "white" }}>
           {editingStaffId ? "แก้ไขพนักงาน" : "เพิ่มพนักงานใหม่"}
         </h2>
-        
+
         <div style={formGridStyle}>
           <div style={fieldGroupStyle}>
             <label style={labelStyle}>ชื่อพนักงาน *</label>
             <input
               value={formData.staff_name}
-              onChange={(e) => setFormData({ ...formData, staff_name: e.target.value })}
+              onChange={(e) =>
+                setFormData({ ...formData, staff_name: e.target.value })
+              }
               style={inputStyle}
               placeholder="ชื่อ-นามสกุล"
             />
@@ -314,7 +519,9 @@ function StaffPage() {
             <label style={labelStyle}>เบอร์โทร *</label>
             <input
               value={formData.staff_phone}
-              onChange={(e) => setFormData({ ...formData, staff_phone: e.target.value })}
+              onChange={(e) =>
+                setFormData({ ...formData, staff_phone: e.target.value })
+              }
               style={inputStyle}
               placeholder="0812345678"
             />
@@ -324,7 +531,9 @@ function StaffPage() {
             <label style={labelStyle}>Username *</label>
             <input
               value={formData.username}
-              onChange={(e) => setFormData({ ...formData, username: e.target.value })}
+              onChange={(e) =>
+                setFormData({ ...formData, username: e.target.value })
+              }
               style={inputStyle}
               placeholder="username"
               disabled={!!editingStaffId}
@@ -333,14 +542,22 @@ function StaffPage() {
 
           <div style={fieldGroupStyle}>
             <label style={labelStyle}>
-              {editingStaffId ? "รหัสผ่าน (เว้นว่างไว้ไม่เปลี่ยน)" : "รหัสผ่าน *"}
+              {editingStaffId
+                ? "รหัสผ่าน (เว้นว่างไว้ไม่เปลี่ยน)"
+                : "รหัสผ่าน *"}
             </label>
             <input
               type="text"
               value={formData.password}
-              onChange={(e) => setFormData({ ...formData, password: e.target.value })}
+              onChange={(e) =>
+                setFormData({ ...formData, password: e.target.value })
+              }
               style={inputStyle}
-              placeholder={editingStaffId ? "รหัสผ่านใหม่ (อย่างน้อย 4 ตัว)" : "รหัสผ่าน (อย่างน้อย 4 ตัว)"}
+              placeholder={
+                editingStaffId
+                  ? "รหัสผ่านใหม่ (อย่างน้อย 4 ตัว)"
+                  : "รหัสผ่าน (อย่างน้อย 4 ตัว)"
+              }
             />
           </div>
 
@@ -348,7 +565,9 @@ function StaffPage() {
             <label style={labelStyle}>ที่อยู่</label>
             <input
               value={formData.address}
-              onChange={(e) => setFormData({ ...formData, address: e.target.value })}
+              onChange={(e) =>
+                setFormData({ ...formData, address: e.target.value })
+              }
               style={inputStyle}
               placeholder="ที่อยู่"
             />
@@ -358,7 +577,9 @@ function StaffPage() {
             <label style={labelStyle}>สถานะ</label>
             <select
               value={formData.status}
-              onChange={(e) => setFormData({ ...formData, status: e.target.value })}
+              onChange={(e) =>
+                setFormData({ ...formData, status: e.target.value })
+              }
               style={inputStyle}
             >
               <option value="active">ใช้งาน</option>
@@ -368,11 +589,23 @@ function StaffPage() {
         </div>
 
         <div style={{ display: "flex", gap: "10px", marginTop: "10px" }}>
-          <button type="submit" style={primaryButtonStyle} disabled={isSubmitting}>
-            {isSubmitting ? "กำลังบันทึก..." : editingStaffId ? "บันทึก" : "เพิ่ม"}
+          <button
+            type="submit"
+            style={primaryButtonStyle}
+            disabled={isSubmitting}
+          >
+            {isSubmitting
+              ? "กำลังบันทึก..."
+              : editingStaffId
+              ? "บันทึก"
+              : "เพิ่ม"}
           </button>
           {editingStaffId && (
-            <button type="button" onClick={clearForm} style={secondaryButtonStyle}>
+            <button
+              type="button"
+              onClick={clearForm}
+              style={secondaryButtonStyle}
+            >
               ยกเลิก
             </button>
           )}
@@ -384,7 +617,7 @@ function StaffPage() {
         <div style={{ flex: 1, minWidth: "220px" }}>
           <input
             type="text"
-            placeholder="ค้นหา (ชื่อ, เบอร์โทร, Username, Password, ที่อยู่)..."
+            placeholder="ค้นหา (ชื่อ, เบอร์โทร, Username, ที่อยู่)..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             style={inputStyle}
@@ -408,36 +641,57 @@ function StaffPage() {
         <table style={tableStyle}>
           <thead>
             <tr>
-              <th style={{ ...thStyle, width: "50px" }}>ID</th>
-              <th style={{ ...thStyle, width: "120px" }}>ชื่อ</th>
-              <th style={{ ...thStyle, width: "110px" }}>เบอร์โทร</th>
-              <th style={{ ...thStyle, width: "100px" }}>Username</th>
-              <th style={{ ...thStyle, width: "100px" }}>Password</th>
-              <th style={{ ...thStyle, width: "180px" }}>ที่อยู่</th>
-              <th style={{ ...thStyle, width: "100px" }}>สถานะงาน</th>
+              <th style={{ ...thStyle, width: "90px" }}>ID</th>
+              <th style={{ ...thStyle, width: "150px" }}>ชื่อ</th>
+              <th style={{ ...thStyle, width: "120px" }}>เบอร์โทร</th>
+              <th style={{ ...thStyle, width: "120px" }}>Username</th>
+              <th style={{ ...thStyle, width: "200px" }}>ที่อยู่</th>
+              <th style={{ ...thStyle, width: "100px" }}>สถานะ</th>
+              <th style={{ ...thStyle, width: "110px" }}>สถานะงาน</th>
               <th style={{ ...thStyle, width: "90px" }}>จำนวนงาน</th>
-              <th style={{ ...thStyle, width: "140px" }}>จัดการ</th>
+              <th style={{ ...thStyle, width: "150px" }}>จัดการ</th>
             </tr>
           </thead>
-        
+
           <tbody>
             {filteredStaffs.length > 0 ? (
               filteredStaffs.map((item, index) => {
-                const pendingCount = Number(item.pending_jobs || 0);
+                const pendingCount = Number(
+                  staffJobCounts[String(item.staff_id)] || 0
+                );
                 const isWorking = pendingCount > 0;
+                const isActive = (item.status || "active") === "active";
 
                 return (
-                  <tr key={`${item.staff_id || 'staff'}-${index}`}>
-                    <td style={tdStyle}>{item.staff_id}</td>
+                  <tr key={`${item.staff_id || "staff"}-${index}`}>
+                    <td
+                      style={{ ...tdStyle, color: "#f59e0b", fontWeight: "bold" }}
+                    >
+                      {item.staff_id}
+                    </td>
                     <td style={tdStyle}>
                       <strong>{removeEmojis(item.staff_name)}</strong>
                     </td>
-                    <td style={tdStyle}>{removeEmojis(item.staff_phone) || "-"}</td>
+                    <td style={tdStyle}>
+                      {removeEmojis(item.staff_phone) || "-"}
+                    </td>
                     <td style={tdStyle}>{removeEmojis(item.username)}</td>
-                    <td style={tdStyle}>{removeEmojis(item.password) || "-"}</td>
                     <td style={tdStyle}>{removeEmojis(item.address) || "-"}</td>
-                    
-                    {/* แสดงสถานะงาน: กำลังส่ง / ว่าง */}
+
+                    {/* สถานะพนักงาน (ใช้งาน/ไม่ใช้งาน) */}
+                    <td style={tdStyle}>
+                      <span
+                        style={{
+                          ...badgeStyle,
+                          backgroundColor: isActive ? "#22c55e" : "#6b7280",
+                          color: "white",
+                        }}
+                      >
+                        {isActive ? "ใช้งาน" : "ไม่ใช้งาน"}
+                      </span>
+                    </td>
+
+                    {/* สถานะงาน */}
                     <td style={tdStyle}>
                       <span
                         style={{
@@ -450,20 +704,31 @@ function StaffPage() {
                       </span>
                     </td>
 
-                    {/* แสดงจำนวนงานที่รอส่ง */}
+                    {/* จำนวนงานที่รอส่ง */}
                     <td style={tdStyle}>
-                      <span style={{ fontWeight: "bold", color: isWorking ? "#f59e0b" : "#9ca3af" }}>
+                      <span
+                        style={{
+                          fontWeight: "bold",
+                          color: isWorking ? "#f59e0b" : "#9ca3af",
+                        }}
+                      >
                         {pendingCount} งาน
                       </span>
                     </td>
 
                     <td style={{ ...tdStyle, whiteSpace: "nowrap" }}>
-                      <button type="button" onClick={() => editStaff(item)} style={editButtonStyle}>
+                      <button
+                        type="button"
+                        onClick={() => editStaff(item)}
+                        style={editButtonStyle}
+                      >
                         แก้ไข
                       </button>
                       <button
                         type="button"
-                        onClick={() => deleteStaff(item.staff_id, item.staff_name)}
+                        onClick={() =>
+                          deleteStaff(item.staff_id, item.staff_name)
+                        }
                         style={deleteButtonStyle}
                       >
                         ลบ
@@ -486,7 +751,9 @@ function StaffPage() {
   );
 }
 
-// ========== Styles ==========
+// ====================================================
+// Styles
+// ====================================================
 const formCardStyle = {
   background: "#1f2937",
   color: "white",
@@ -538,7 +805,7 @@ const tableStyle = {
   color: "white",
   borderRadius: "12px",
   overflow: "hidden",
-  tableLayout: "fixed", 
+  tableLayout: "fixed",
 };
 
 const thStyle = {
@@ -556,9 +823,9 @@ const tdStyle = {
   textAlign: "left",
   borderBottom: "1px solid #374151",
   fontSize: "13px",
-  wordBreak: "break-word",    
-  whiteSpace: "normal",       
-  verticalAlign: "middle",   
+  wordBreak: "break-word",
+  whiteSpace: "normal",
+  verticalAlign: "middle",
 };
 
 const primaryButtonStyle = {
