@@ -1,10 +1,137 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import Layout from "../components/Layout";
 import { Html5QrcodeScanner } from "html5-qrcode";
-import API_BASE_URL from "../config";
 
-const UPLOADS_BASE_URL = API_BASE_URL.replace(/\/models\/?$/, "/uploads");
+// ====================================================
+// Persistence (เชื่อม JSON เดียวกับ GasPage ผ่าน /api/data)
+//   - อ่าน/เขียนไฟล์จริงผ่าน Vite API  -> /api/data
+//     (ตัว middleware จะเขียนลง src/pages/Data.json)
+//   - เก็บสำเนาใน localStorage (offline fallback)
+// ====================================================
+const DB_KEY = "gas_system_db_v1";
+const OPT_KEY = "gas_system_options_v1";
+const API_URL = "/api/data";
 
+const clone = (obj) => JSON.parse(JSON.stringify(obj));
+
+const emptyDb = () => ({
+  tables: {
+    gas_cylinder: [],
+    delivery: [],
+    customer: [],
+    delivery_staff: [],
+  },
+});
+
+const normalizeDb = (d) => {
+  const out = d && typeof d === "object" ? d : emptyDb();
+  if (!out.tables) out.tables = {};
+  if (!Array.isArray(out.tables.gas_cylinder)) out.tables.gas_cylinder = [];
+  if (!Array.isArray(out.tables.delivery)) out.tables.delivery = [];
+  if (!Array.isArray(out.tables.customer)) out.tables.customer = [];
+  if (!Array.isArray(out.tables.delivery_staff)) out.tables.delivery_staff = [];
+  return out;
+};
+
+// ---------- localStorage ----------
+const loadLocalDb = () => {
+  try {
+    const raw = localStorage.getItem(DB_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.tables) return parsed;
+    }
+  } catch (e) {
+    console.warn("loadLocalDb error:", e);
+  }
+  return null;
+};
+const saveLocalDb = (db) => {
+  try {
+    localStorage.setItem(DB_KEY, JSON.stringify(db));
+  } catch (e) {
+    console.warn("saveLocalDb error:", e);
+  }
+};
+
+const loadLocalOptions = () => {
+  try {
+    const raw = localStorage.getItem(OPT_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return null;
+};
+const saveLocalOptions = (opts) => {
+  try {
+    localStorage.setItem(OPT_KEY, JSON.stringify(opts));
+  } catch (e) {}
+};
+
+// ---------- API (Vite middleware) ----------
+const fetchFileDb = async () => {
+  const res = await fetch(API_URL, { cache: "no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+};
+const writeFileDb = async (db) => {
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(db),
+  });
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const j = await res.json();
+      if (j?.error) msg = j.error;
+    } catch (_) {}
+    throw new Error(msg);
+  }
+  return res.json();
+};
+
+// ---------- Options / IDs ----------
+const deriveOptions = (cylinders) => {
+  const uniq = (arr) => [...new Set(arr.filter((v) => v && String(v).trim()))];
+  return {
+    brands: uniq(cylinders.map((c) => c.brand)),
+    gas_types: uniq(cylinders.map((c) => c.gas_type)),
+    sizes: uniq(cylinders.map((c) => c.size)),
+    locations: uniq(cylinders.map((c) => c.current_location)),
+  };
+};
+
+const genDeliveryId = (list) => {
+  const nums = list
+    .map((d) =>
+      parseInt(String(d.delivery_id || "").replace(/\D/g, ""), 10)
+    )
+    .filter((n) => !isNaN(n));
+  const next = (nums.length ? Math.max(...nums) : 0) + 1;
+  return `DLV${String(next).padStart(3, "0")}`;
+};
+
+const genCylinderId = (list) => {
+  const nums = list
+    .map((c) =>
+      parseInt(String(c.cylinder_id || "").replace(/\D/g, ""), 10)
+    )
+    .filter((n) => !isNaN(n));
+  const next = (nums.length ? Math.max(...nums) : 0) + 1;
+  return `CYL${String(next).padStart(3, "0")}`;
+};
+
+const genCustomerId = (list) => {
+  const nums = list
+    .map((c) =>
+      parseInt(String(c.customer_id || "").replace(/\D/g, ""), 10)
+    )
+    .filter((n) => !isNaN(n));
+  const next = (nums.length ? Math.max(...nums) : 0) + 1;
+  return `CUS${String(next).padStart(3, "0")}`;
+};
+
+// ---------- User info ----------
 const getInitialUserData = () => {
   const storedRole = localStorage.getItem("role") || "";
   const storedUsername =
@@ -26,6 +153,18 @@ const getInitialUserData = () => {
   return { storedRole, storedUsername, storedStaffId };
 };
 
+// ---------- File helpers ----------
+const fileToBase64 = (file) =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => resolve(e.target.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+
+// ====================================================
+// Component
+// ====================================================
 function DeliveryPage() {
   const { storedRole, storedUsername, storedStaffId } = getInitialUserData();
 
@@ -33,18 +172,22 @@ function DeliveryPage() {
   const [username] = useState(storedUsername);
   const [staffId] = useState(storedStaffId);
 
-  const [deliveries, setDeliveries] = useState([]);
-  const [cylinders, setCylinders] = useState([]);
-  const [staffs, setStaffs] = useState([]);
-  const [customers, setCustomers] = useState([]);
-  const [gasLevel, setGasLevel] = useState(0);
+  const [db, setDb] = useState(null);
+  const [options, setOptions] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [gettingLocationId, setGettingLocationId] = useState(null);
+  const [apiAvailable, setApiAvailable] = useState(true);
+  const [syncStatus, setSyncStatus] = useState("idle");
 
+  const loadedDbRef = useRef(null);
+  const pendingSaveRef = useRef(null);
+  const saveInFlightRef = useRef(false);
+  const seededRef = useRef(false);
+
+  // ---------- UI state ----------
+  const [gettingLocationId, setGettingLocationId] = useState(null);
   const [selectedProofId, setSelectedProofId] = useState(null);
   const [confirmCylinderInputs, setConfirmCylinderInputs] = useState({});
   const [adminApproveInputs, setAdminApproveInputs] = useState({});
-
   const [scanningJobId, setScanningJobId] = useState(null);
 
   const [showCylinderModal, setShowCylinderModal] = useState(false);
@@ -83,45 +226,188 @@ function DeliveryPage() {
   const [newSize, setNewSize] = useState("");
   const [newStaffId, setNewStaffId] = useState("");
 
-  const apiFetch = async (url, options = {}) => {
-    const token = localStorage.getItem("token") || "";
+  // ====================================================
+  // Load on mount
+  // ====================================================
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const fileDb = await fetchFileDb();
+        if (cancelled) return;
+        if (!fileDb || !fileDb.tables) throw new Error("Data.json ไม่ถูกรูปแบบ");
+        const norm = normalizeDb(fileDb);
+        loadedDbRef.current = norm;
+        setDb(norm);
+        setOptions(loadLocalOptions() || deriveOptions(norm.tables.gas_cylinder));
+        setApiAvailable(true);
+      } catch (err) {
+        console.warn("โหลดจาก /api/data ไม่ได้ -> ใช้ localStorage:", err);
+        if (cancelled) return;
+        setApiAvailable(false);
+        setSyncStatus("offline");
+        const local = loadLocalDb();
+        if (local?.tables) {
+          const norm = normalizeDb(local);
+          loadedDbRef.current = norm;
+          setDb(norm);
+          setOptions(loadLocalOptions() || deriveOptions(norm.tables.gas_cylinder));
+        } else {
+          const norm = emptyDb();
+          loadedDbRef.current = norm;
+          setDb(norm);
+          setOptions(deriveOptions([]));
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-    const defaultHeaders = {
-      "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  // ---------- Persist to localStorage ----------
+  useEffect(() => {
+    if (db) saveLocalDb(db);
+  }, [db]);
+  useEffect(() => {
+    if (options) saveLocalOptions(options);
+  }, [options]);
+
+  // ---------- Realtime auto-save (coalesce) ----------
+  useEffect(() => {
+    if (!db || loading) return;
+    if (db === loadedDbRef.current) return;
+    if (!apiAvailable) return;
+
+    pendingSaveRef.current = db;
+
+    const drain = async () => {
+      if (saveInFlightRef.current) return;
+      saveInFlightRef.current = true;
+      setSyncStatus("saving");
+      try {
+        while (pendingSaveRef.current) {
+          const toSave = pendingSaveRef.current;
+          pendingSaveRef.current = null;
+          await writeFileDb(toSave);
+        }
+        setSyncStatus("saved");
+        setTimeout(() => setSyncStatus("idle"), 1500);
+      } catch (err) {
+        console.error("Auto-save failed:", err);
+        setSyncStatus("error");
+      } finally {
+        saveInFlightRef.current = false;
+        if (pendingSaveRef.current) drain();
+      }
     };
 
-    const res = await fetch(url, {
-      ...options,
-      credentials: "include",
-      headers: {
-        ...defaultHeaders,
-        ...options.headers,
-      },
+    drain();
+  }, [db, loading, apiAvailable]);
+
+  // ---------- Flush before unload ----------
+  useEffect(() => {
+    const flush = () => {
+      if (!pendingSaveRef.current || !apiAvailable) return;
+      try {
+        const blob = new Blob([JSON.stringify(pendingSaveRef.current)], {
+          type: "application/json",
+        });
+        navigator.sendBeacon?.(API_URL, blob);
+      } catch (_) {}
+    };
+    window.addEventListener("beforeunload", flush);
+    return () => window.removeEventListener("beforeunload", flush);
+  }, [apiAvailable]);
+
+  // ---------- Seed default staff (ครั้งแรก) ----------
+  useEffect(() => {
+    if (!db || loading || seededRef.current) return;
+    if ((db.tables.delivery_staff || []).length > 0) {
+      seededRef.current = true;
+      return;
+    }
+    seededRef.current = true;
+    setDb((prev) => {
+      if (!prev) return prev;
+      if ((prev.tables.delivery_staff || []).length > 0) return prev;
+      const next = clone(prev);
+      next.tables.delivery_staff = [
+        { staff_id: "STF001", staff_name: "สมชาย ใจดี" },
+        { staff_id: "STF002", staff_name: "สมหญิง รักงาน" },
+        { staff_id: "STF003", staff_name: "วิชัย ขับดี" },
+      ];
+      return next;
     });
+  }, [db, loading]);
 
-    if (!res.ok) {
-      if (res.status === 401) {
-        alert("เซสชันหมดอายุ กรุณาเข้าสู่ระบบใหม่อีกครั้ง");
-      }
-      throw new Error(`HTTP ${res.status}`);
-    }
+  // ---------- Update helper ----------
+  const updateDb = useCallback((updater) => {
+    setDb((prev) => {
+      const next = clone(prev || emptyDb());
+      updater(next);
+      return next;
+    });
+  }, []);
 
-    const text = await res.text();
-    try {
-      return JSON.parse(text);
-    } catch (e) {
-      console.error("Invalid JSON from server:", text.slice(0, 200));
-      throw new Error("Server responded with non-JSON");
-    }
-  };
+  // ====================================================
+  // Derived data
+  // ====================================================
+  const tables = db?.tables || {};
+  const rawDeliveries = tables.delivery || [];
+  const cylinders = tables.gas_cylinder || [];
+  const staffs = tables.delivery_staff || [];
+  const customers = tables.customer || [];
 
-  const brandOptions = useMemo(() => ["ปตท.", "World Gas", "สยามแก๊ส", "ยูนิคแก๊ส", "PT Gas", "พีเอพี"], []);
+  // enrich deliveries with customer name/address
+  const deliveries = useMemo(() => {
+    return rawDeliveries.map((d) => {
+      const cust =
+        customers.find((c) => c.customer_id === d.customer_id) ||
+        customers.find(
+          (c) =>
+            (c.phone || c.customer_phone || "").trim() ===
+            String(d.phone || "").trim()
+        );
+      return {
+        ...d,
+        // unified view for UI
+        id: d.delivery_id,
+        customerName: d.customer_name || cust?.name || cust?.customer_name || "-",
+        phone: d.phone || cust?.phone || cust?.customer_phone || "-",
+        address: d.address || cust?.address || cust?.customer_address || "-",
+        mapPin: d.map_pin || cust?.map_pin || cust?.mapPin || "",
+        brand: d.brand || d.req_brand || "-",
+        gasType: d.gas_type || d.gasType || d.req_gas_type || "LPG",
+        size: d.size || d.req_size || "-",
+        assignedStaff: d.staff_name || "-",
+        proofImagePath: d.proof_image_path || d.proofImagePath || "",
+      };
+    });
+  }, [rawDeliveries, customers]);
+
+  // ---------- Options ----------
+  const brandOptions = useMemo(() => {
+    const base = ["ปตท.", "World Gas", "สยามแก๊ส", "ยูนิคแก๊ส", "PT Gas", "พีเอพี"];
+    const derived = options?.brands || [];
+    return [...new Set([...derived, ...base])];
+  }, [options]);
   const gasTypeOptions = useMemo(() => ["LPG"], []);
-  const sizeOptions = useMemo(() => ["4 กก.", "7 กก.", "11.5 กก.", "13.5 กก.", "15 กก.", "48 กก."], []);
+  const sizeOptions = useMemo(() => {
+    const base = ["4 กก.", "7 กก.", "11.5 กก.", "13.5 กก.", "15 กก.", "48 กก."];
+    const derived = options?.sizes || [];
+    return [...new Set([...derived, ...base])];
+  }, [options]);
 
+  // ====================================================
+  // Helpers
+  // ====================================================
   const findCustomerByPhone = (phone) =>
-    customers.find((c) => (c.phone || c.customer_phone || "").trim() === phone.trim());
+    customers.find(
+      (c) => (c.phone || c.customer_phone || "").trim() === phone.trim()
+    );
 
   const calculateExpiry = (manuDate) => {
     if (!manuDate) return "";
@@ -130,93 +416,7 @@ function DeliveryPage() {
     return d.toISOString().split("T")[0];
   };
 
-  const loadData = useCallback(async (isBackground = false) => {
-    try {
-      if (!isBackground) setLoading(true);
-
-      apiFetch(`${API_BASE_URL}/gas/latest.php`)
-        .then((res) => {
-          if (res && res.success && res.data) {
-            setGasLevel(Number(res.data.gas_value));
-          }
-        })
-        .catch(() => {});
-
-      const [deliveriesRes, cylindersRes, staffsRes, customersRes] = await Promise.allSettled([
-        apiFetch(`${API_BASE_URL}/delivery/list.php`),
-        apiFetch(`${API_BASE_URL}/cylinder/list.php`),
-        apiFetch(`${API_BASE_URL}/staff/list.php`),
-        apiFetch(`${API_BASE_URL}/customer/list.php`),
-      ]);
-
-      const staffList = staffsRes.status === "fulfilled" && staffsRes.value.success ? staffsRes.value.data : [];
-      if (staffsRes.status === "fulfilled" && staffsRes.value.success) {
-        setStaffs(staffList);
-      }
-
-      if (deliveriesRes.status === "fulfilled" && deliveriesRes.value.success) {
-        const rawData = deliveriesRes.value.data || deliveriesRes.value.items || [];
-
-        const formattedDeliveries = rawData.map((d) => {
-          const realId = d.delivery_id || d.id;
-          const currentStaffId = String(d.staff_id ?? d.staffId ?? "").trim();
-
-          const matchedStaff = staffList.find(
-            (s) =>
-              (currentStaffId && String(s.staff_id) === currentStaffId) ||
-              (d.staff_name && String(s.staff_name).includes(d.staff_name)) ||
-              (d.assignedStaff && String(s.staff_name).includes(d.assignedStaff))
-          );
-
-          const staffName =
-            d.assignedStaff ||
-            d.staff_name ||
-            (matchedStaff ? matchedStaff.staff_name : "") ||
-            "ไม่ระบุชื่อ";
-
-          return {
-            ...d,
-            id: realId,
-            customerName: d.customerName || d.customer_name || d.name || "ไม่ระบุชื่อลูกค้า",
-            phone: d.phone || d.customer_phone || "-",
-            address: d.address || d.customer_address || "-",
-            mapPin: d.mapPin || d.map_pin || "-",
-            brand: d.brand || d.req_brand || "-",
-            gasType: d.gasType || d.gas_type || d.req_gas_type || "LPG",
-            size: d.size || d.req_size || "-",
-            staff_id: currentStaffId || (matchedStaff ? String(matchedStaff.staff_id) : ""),
-            assignedStaff: staffName,
-            status: d.status || "pending",
-            proofImagePath: d.proofImagePath || d.proof_image_path || "",
-          };
-        });
-
-        setDeliveries(formattedDeliveries);
-      }
-
-      if (cylindersRes.status === "fulfilled" && cylindersRes.value.success) {
-        setCylinders(cylindersRes.value.data);
-      }
-
-      if (customersRes.status === "fulfilled" && customersRes.value.success) {
-        setCustomers(customersRes.value.data);
-      }
-    } catch (error) {
-      console.error("โหลดข้อมูลล้มเหลว", error);
-    } finally {
-      if (!isBackground) setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadData();
-    const interval = setInterval(() => {
-      loadData(true);
-    }, 10000);
-
-    return () => clearInterval(interval);
-  }, [loadData]);
-
+  // ---------- QR scanner ----------
   useEffect(() => {
     let scanner = null;
     if (scanningJobId) {
@@ -256,6 +456,9 @@ function DeliveryPage() {
     };
   }, [scanningJobId]);
 
+  // ====================================================
+  // GPS: บันทึกพิกัดลง customer
+  // ====================================================
   const handleSaveCurrentLocation = (item) => {
     if (!navigator.geolocation) {
       alert("อุปกรณ์หรือเบราว์เซอร์นี้ไม่รองรับการดึงพิกัด GPS");
@@ -265,35 +468,29 @@ function DeliveryPage() {
     setGettingLocationId(item.id);
 
     navigator.geolocation.getCurrentPosition(
-      async (position) => {
+      (position) => {
         const lat = position.coords.latitude;
         const lng = position.coords.longitude;
         const mapPinString = `${lat},${lng}`;
 
-        try {
-          const res = await apiFetch(`${API_BASE_URL}/customer/update.php`, {
-            method: "PUT",
-            body: JSON.stringify({
-              old_phone: item.phone,
-              new_phone: item.phone,
-              name: item.customerName,
-              address: item.address,
-              map_pin: mapPinString,
-            }),
-          });
-
-          if (res && res.success) {
-            alert(`บันทึกพิกัด GPS สำเร็จ: ${mapPinString}`);
-            await loadData();
-          } else {
-            alert(res.message || "บันทึกพิกัด GPS ไม่สำเร็จ");
+        // อัปเดตใน delivery + customer (ถ้ามี)
+        updateDb((draft) => {
+          const list = draft.tables.delivery || [];
+          const idx = list.findIndex((d) => d.delivery_id === item.id);
+          if (idx >= 0) {
+            list[idx] = { ...list[idx], map_pin: mapPinString, updated_at: new Date().toISOString() };
           }
-        } catch (err) {
-          console.error("Error saving GPS location:", err);
-          alert("เกิดข้อผิดพลาดในการเชื่อมต่อเพื่อบันทึกพิกัด GPS");
-        } finally {
-          setGettingLocationId(null);
-        }
+          const custList = draft.tables.customer || [];
+          const cIdx = custList.findIndex(
+            (c) => (c.phone || c.customer_phone || "").trim() === String(item.phone || "").trim()
+          );
+          if (cIdx >= 0) {
+            custList[cIdx] = { ...custList[cIdx], map_pin: mapPinString, updated_at: new Date().toISOString() };
+          }
+        });
+
+        alert(`บันทึกพิกัด GPS สำเร็จ: ${mapPinString}`);
+        setGettingLocationId(null);
       },
       (error) => {
         setGettingLocationId(null);
@@ -321,7 +518,10 @@ function DeliveryPage() {
     );
   };
 
-  const handleSearchCustomer = async () => {
+  // ====================================================
+  // Customer
+  // ====================================================
+  const handleSearchCustomer = () => {
     if (!newPhone.trim()) {
       alert("กรุณากรอกเบอร์โทรศัพท์เพื่อค้นหา");
       return;
@@ -331,27 +531,12 @@ function DeliveryPage() {
     if (exist) {
       setNewCustomerName(exist.name || exist.customer_name || "");
       setNewAddress(exist.address || exist.customer_address || "");
-      setNewMapPin(exist.mapPin || exist.map_pin || "");
+      setNewMapPin(exist.map_pin || exist.mapPin || "");
       setIsCustomerFound(true);
       alert("พบข้อมูลลูกค้าในระบบ");
     } else {
-      try {
-        const res = await apiFetch(`${API_BASE_URL}/customer/get.php?phone=${encodeURIComponent(newPhone.trim())}`);
-        if (res && res.success && res.data) {
-          setNewCustomerName(res.data.name || res.data.customer_name || "");
-          setNewAddress(res.data.address || res.data.customer_address || "");
-          setNewMapPin(res.data.map_pin || res.data.mapPin || "");
-          setIsCustomerFound(true);
-          alert("พบข้อมูลลูกค้าในระบบ");
-        } else {
-          setIsCustomerFound(false);
-          alert("ไม่พบข้อมูลลูกค้า เบอร์นี้สามารถกรอกเป็นลูกค้าใหม่ได้ทันที");
-        }
-      } catch (err) {
-        console.error("Search customer error:", err);
-        setIsCustomerFound(false);
-        alert("ไม่พบข้อมูลลูกค้าในระบบ สามารถกรอกข้อมูลใหม่ได้ทันที");
-      }
+      setIsCustomerFound(false);
+      alert("ไม่พบข้อมูลลูกค้า เบอร์นี้สามารถกรอกเป็นลูกค้าใหม่ได้ทันที");
     }
   };
 
@@ -366,42 +551,53 @@ function DeliveryPage() {
     setIsEditingCustomer(true);
   };
 
-  const handleSaveCustomerEdit = async () => {
+  const handleSaveCustomerEdit = () => {
     if (!editCustomerData.new_phone.trim()) {
       alert("กรุณากรอกเบอร์โทรศัพท์ใหม่");
       return;
     }
 
-    try {
-      const res = await apiFetch(`${API_BASE_URL}/customer/update.php`, {
-        method: "PUT",
-        body: JSON.stringify({
-          old_phone: editCustomerData.old_phone,
-          new_phone: editCustomerData.new_phone,
+    updateDb((draft) => {
+      const list = draft.tables.customer || [];
+      const idx = list.findIndex(
+        (c) =>
+          (c.phone || c.customer_phone || "").trim() ===
+          editCustomerData.old_phone.trim()
+      );
+      if (idx >= 0) {
+        list[idx] = {
+          ...list[idx],
+          phone: editCustomerData.new_phone.trim(),
           name: editCustomerData.name,
           address: editCustomerData.address,
           map_pin: editCustomerData.map_pin,
-        }),
-      });
-
-      if (res.success) {
-        alert("อัปเดตข้อมูลลูกค้าเรียบร้อยแล้ว");
-        setNewPhone(editCustomerData.new_phone);
-        setNewCustomerName(editCustomerData.name);
-        setNewAddress(editCustomerData.address);
-        setNewMapPin(editCustomerData.map_pin);
-        setIsEditingCustomer(false);
-        await loadData();
+          updated_at: new Date().toISOString(),
+        };
       } else {
-        alert(res.message || "แก้ไขข้อมูลไม่สำเร็จ");
+        list.push({
+          customer_id: genCustomerId(list),
+          phone: editCustomerData.new_phone.trim(),
+          name: editCustomerData.name,
+          address: editCustomerData.address,
+          map_pin: editCustomerData.map_pin,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        });
       }
-    } catch (error) {
-      console.error("Update Customer Error:", error);
-      alert("เกิดข้อผิดพลาดในการเชื่อมต่อ");
-    }
+    });
+
+    setNewPhone(editCustomerData.new_phone);
+    setNewCustomerName(editCustomerData.name);
+    setNewAddress(editCustomerData.address);
+    setNewMapPin(editCustomerData.map_pin);
+    setIsEditingCustomer(false);
+    alert("อัปเดตข้อมูลลูกค้าเรียบร้อยแล้ว");
   };
 
-  const createDeliveryJob = async () => {
+  // ====================================================
+  // Create Delivery Job
+  // ====================================================
+  const createDeliveryJob = () => {
     if (!newCustomerName || !newPhone || !newAddress || !newStaffId) {
       alert("กรุณากรอกข้อมูลลูกค้าและพนักงานส่งให้ครบ");
       return;
@@ -411,48 +607,80 @@ function DeliveryPage() {
       return;
     }
 
-    const payload = {
-      customer_name: newCustomerName.trim(),
-      phone: newPhone.trim(),
-      address: newAddress.trim(),
-      map_pin: newMapPin.trim(),
-      brand: newBrand,
-      gas_type: newGasType,
-      size: newSize,
-      staff_id: newStaffId,
-      status: "pending",
-    };
+    const staff = staffs.find((s) => String(s.staff_id) === String(newStaffId));
+    const staffName = staff ? staff.staff_name : "";
 
-    try {
-      const res = await apiFetch(`${API_BASE_URL}/delivery/create.php`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      if (res && (res.success || res.status === "success" || res.delivery_id)) {
-        alert("สร้างงานจัดส่งเรียบร้อยแล้ว");
-
-        setNewCustomerName("");
-        setNewPhone("");
-        setNewAddress("");
-        setNewMapPin("");
-        setNewBrand("");
-        setNewSize("");
-        setNewStaffId("");
-        setIsCustomerFound(false);
-
-        await loadData();
+    updateDb((draft) => {
+      // upsert customer
+      const custList = draft.tables.customer || [];
+      const cIdx = custList.findIndex(
+        (c) => (c.phone || c.customer_phone || "").trim() === newPhone.trim()
+      );
+      let customerId;
+      if (cIdx >= 0) {
+        customerId = custList[cIdx].customer_id;
+        custList[cIdx] = {
+          ...custList[cIdx],
+          name: newCustomerName.trim(),
+          address: newAddress.trim(),
+          map_pin: newMapPin.trim(),
+          updated_at: new Date().toISOString(),
+        };
       } else {
-        alert(res.message || "สร้างงานไม่สำเร็จ");
+        customerId = genCustomerId(custList);
+        custList.push({
+          customer_id: customerId,
+          name: newCustomerName.trim(),
+          phone: newPhone.trim(),
+          address: newAddress.trim(),
+          map_pin: newMapPin.trim(),
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        });
       }
-    } catch (error) {
-      console.error("Create Delivery Error:", error);
-      alert("เกิดข้อผิดพลาดในการสร้างงาน");
-    }
+
+      // push delivery
+      const list = draft.tables.delivery || [];
+      const deliveryId = genDeliveryId(list);
+      list.push({
+        delivery_id: deliveryId,
+        customer_id: customerId,
+        customer_name: newCustomerName.trim(),
+        phone: newPhone.trim(),
+        address: newAddress.trim(),
+        map_pin: newMapPin.trim(),
+        req_brand: newBrand,
+        req_gas_type: newGasType,
+        req_size: newSize,
+        brand: newBrand,
+        gas_type: newGasType,
+        size: newSize,
+        staff_id: String(newStaffId),
+        staff_name: staffName,
+        serial_number: "",
+        status: "pending",
+        proof_image_path: "",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    });
+
+    alert("สร้างงานจัดส่งเรียบร้อยแล้ว");
+
+    setNewCustomerName("");
+    setNewPhone("");
+    setNewAddress("");
+    setNewMapPin("");
+    setNewBrand("");
+    setNewSize("");
+    setNewStaffId("");
+    setIsCustomerFound(false);
   };
 
-  const confirmReceiveJob = async (jobItem) => {
+  // ====================================================
+  // Staff: confirm receive
+  // ====================================================
+  const confirmReceiveJob = (jobItem) => {
     const serialNumber = confirmCylinderInputs[jobItem.id]?.trim();
     if (!serialNumber) return alert("กรุณาสแกน QR Code ถังแก๊สเพื่อยืนยัน");
 
@@ -461,7 +689,7 @@ function DeliveryPage() {
       alert(`ไม่พบถังแก๊ส Serial Number "${serialNumber}" ในระบบ`);
       return;
     }
-    if (cylinder.status !== "ในคลัง") {
+    if ((cylinder.status || "").trim() !== "ในคลัง") {
       alert(`ถังแก๊ส "${serialNumber}" ไม่อยู่ในคลัง (สถานะปัจจุบัน: ${cylinder.status})`);
       return;
     }
@@ -474,11 +702,7 @@ function DeliveryPage() {
     const cylGasType = cylinder.gas_type || cylinder.gasType || "";
     const cylSize = cylinder.size || "";
 
-    if (
-      cylBrand !== targetBrand ||
-      cylGasType !== targetGasType ||
-      cylSize !== targetSize
-    ) {
+    if (cylBrand !== targetBrand || cylGasType !== targetGasType || cylSize !== targetSize) {
       alert(
         `สเปกถังแก๊สไม่ตรงตามเงื่อนไข!\n\n` +
           `ความต้องการงาน: ${targetBrand} | ${targetGasType} | ${targetSize}\n` +
@@ -487,122 +711,149 @@ function DeliveryPage() {
       return;
     }
 
-    try {
-      const res = await apiFetch(`${API_BASE_URL}/delivery/update.php`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          delivery_id: jobItem.id,
-          action: "pick",
-          serialNumber: serialNumber,
-        }),
-      });
-
-      if (res.success) {
-        alert("ตรวจสอบสเปกถูกต้อง! รับงานและผูกถังแก๊สเรียบร้อยแล้ว");
-
-        setDeliveries((prev) =>
-          prev.map((d) =>
-            d.id === jobItem.id ? { ...d, status: "delivering", serial_number: serialNumber } : d
-          )
-        );
-
-        await loadData();
-        setConfirmCylinderInputs((prev) => ({ ...prev, [jobItem.id]: "" }));
-      } else {
-        alert(res.message || "ไม่สามารถรับงานได้");
+    updateDb((draft) => {
+      // update delivery
+      const list = draft.tables.delivery || [];
+      const idx = list.findIndex((d) => d.delivery_id === jobItem.id);
+      if (idx >= 0) {
+        list[idx] = {
+          ...list[idx],
+          serial_number: serialNumber,
+          status: "delivering",
+          updated_at: new Date().toISOString(),
+        };
       }
-    } catch (error) {
-      console.error(error);
-      alert("เกิดข้อผิดพลาดในการรับงาน");
-    }
+      // update cylinder status
+      const cylList = draft.tables.gas_cylinder || [];
+      const cIdx = cylList.findIndex((c) => c.serial_number === serialNumber);
+      if (cIdx >= 0) {
+        cylList[cIdx] = {
+          ...cylList[cIdx],
+          status: "pending",
+          current_location: "กำลังจัดส่ง",
+          updated_at: new Date().toISOString(),
+        };
+      }
+    });
+
+    alert("ตรวจสอบสเปกถูกต้อง! รับงานและผูกถังแก๊สเรียบร้อยแล้ว");
+    setConfirmCylinderInputs((prev) => ({ ...prev, [jobItem.id]: "" }));
   };
 
+  // ====================================================
+  // Staff: proof upload → base64 → pending_approval
+  // ====================================================
   const handleProofUpload = async (id, file) => {
     if (!file) return;
-    const formData = new FormData();
-    formData.append("delivery_id", id);
-    formData.append("proof", file);
-
     try {
-      const res = await fetch(`${API_BASE_URL}/delivery/upload_proof.php`, {
-        method: "POST",
-        body: formData,
-      });
-      const data = await res.json();
-
-      if (data.success) {
-        const uploadedPath = data.filePath || data.filename || data.path || "";
-
-        const completeRes = await apiFetch(`${API_BASE_URL}/delivery/update.php`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            delivery_id: id,
-            action: "complete_by_staff",
-            proof_image_path: uploadedPath,
-          }),
-        });
-
-        if (completeRes.success) {
-          alert("ส่งรูปหลักฐานสำเร็จ รออนุมัติงาน");
-          setSelectedProofId(null);
-
-          setDeliveries((prevDeliveries) =>
-            prevDeliveries.map((d) => {
-              if (String(d.id) === String(id) || String(d.delivery_id) === String(id)) {
-                return {
-                  ...d,
-                  status: "pending_approval",
-                  proofImagePath: uploadedPath,
-                  proof_image_path: uploadedPath,
-                };
-              }
-              return d;
-            })
-          );
-
-          await loadData();
-        } else {
-          alert(completeRes.message || "อัปเดตสถานะงานไม่สำเร็จ");
-        }
-      } else {
-        alert(data.message || "อัปโหลดรูปภาพไม่สำเร็จ");
+      const dataUrl = await fileToBase64(file);
+      // จำกัดขนาด ~3MB
+      if (dataUrl.length > 3 * 1024 * 1024 * 1.4) {
+        if (!window.confirm("ไฟล์รูปใหญ่เกินไป อาจทำให้ไฟล์ Data.json ใหญ่ขึ้นมาก ต้องการดำเนินการต่อหรือไม่?")) return;
       }
+
+      updateDb((draft) => {
+        const list = draft.tables.delivery || [];
+        const idx = list.findIndex(
+          (d) =>
+            String(d.delivery_id) === String(id) || String(d.id) === String(id)
+        );
+        if (idx >= 0) {
+          list[idx] = {
+            ...list[idx],
+            status: "pending_approval",
+            proof_image_path: dataUrl,
+            updated_at: new Date().toISOString(),
+          };
+        }
+      });
+
+      alert("ส่งรูปหลักฐานสำเร็จ รออนุมัติงาน");
+      setSelectedProofId(null);
     } catch (error) {
       console.error("Upload error:", error);
       alert("เกิดข้อผิดพลาดในการอัปโหลดรูปภาพ");
     }
   };
 
-  const sendApproveRequest = async (id, receivedSerialNumber, newCylinderData = null) => {
-    const payload = {
-      delivery_id: id,
-      action: "approve",
-      receivedSerialNumber: receivedSerialNumber,
-    };
-    if (newCylinderData) payload.new_cylinder = newCylinderData;
+  // ====================================================
+  // Admin: approve / create cylinder
+  // ====================================================
+  const sendApproveRequest = (id, receivedSerialNumber, newCylinderData = null) => {
+    updateDb((draft) => {
+      // delivery → success
+      const list = draft.tables.delivery || [];
+      const idx = list.findIndex((d) => d.delivery_id === id);
+      if (idx >= 0) {
+        list[idx] = {
+          ...list[idx],
+          status: "success",
+          received_serial_number: receivedSerialNumber,
+          delivered_date: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+      }
 
-    const res = await apiFetch(`${API_BASE_URL}/delivery/update.php`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      // cylinder: อัปเดตถังที่ส่งไป (ตัวที่ออกจากคลัง) → จัดส่งสำเร็จ
+      const cylList = draft.tables.gas_cylinder || [];
+      const sentSerial = list[idx]?.serial_number;
+      if (sentSerial) {
+        const sIdx = cylList.findIndex((c) => c.serial_number === sentSerial);
+        if (sIdx >= 0) {
+          cylList[sIdx] = {
+            ...cylList[sIdx],
+            status: "success",
+            current_location: "ส่งถึงลูกค้า",
+            delivered_date: new Date().toISOString().split("T")[0],
+            updated_at: new Date().toISOString(),
+          };
+        }
+      }
+
+      // cylinder: รับคืน → กลับเข้าคลัง
+      if (newCylinderData) {
+        const exists = cylList.some((c) => c.serial_number === newCylinderData.serial_number);
+        if (!exists) {
+          cylList.push({
+            cylinder_id: genCylinderId(cylList),
+            serial_number: newCylinderData.serial_number,
+            brand: newCylinderData.brand,
+            gas_type: newCylinderData.gas_type || "LPG",
+            size: newCylinderData.size,
+            manufacture_date: newCylinderData.manufacture_date,
+            expiry_date: newCylinderData.expiry_date,
+            last_check_date: newCylinderData.last_check_date,
+            next_check_date: newCylinderData.next_check_date,
+            delivered_date: newCylinderData.delivered_date,
+            current_location: newCylinderData.current_location || "คลัง",
+            status: "ในคลัง",
+            qr_code: null,
+            assigned_to: null,
+            assigned_date: null,
+            deleted_at: null,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          });
+        }
+      } else if (receivedSerialNumber) {
+        const rIdx = cylList.findIndex((c) => c.serial_number === receivedSerialNumber);
+        if (rIdx >= 0) {
+          cylList[rIdx] = {
+            ...cylList[rIdx],
+            status: "ในคลัง",
+            current_location: "คลัง",
+            updated_at: new Date().toISOString(),
+          };
+        }
+      }
     });
-    if (res.success) {
-      alert("อนุมัติงานสำเร็จ");
-      await loadData();
-      setAdminApproveInputs((prev) => ({ ...prev, [id]: "" }));
-      setShowCylinderModal(false);
-    } else if (res.need_create_cylinder) {
-      setPendingApproveId(id);
-      setNewCylinderForApproval((prev) => ({ ...prev, serial_number: res.serial_number }));
-      setShowCylinderModal(true);
-    } else {
-      alert(res.message || "อนุมัติไม่สำเร็จ");
-    }
+
+    alert("อนุมัติงานสำเร็จ");
+    setAdminApproveInputs((prev) => ({ ...prev, [id]: "" }));
+    setShowCylinderModal(false);
   };
 
-  const approveDelivery = async (id) => {
+  const approveDelivery = (id) => {
     const receivedSerialNumber = adminApproveInputs[id]?.trim();
     if (!receivedSerialNumber) return alert("กรุณากรอก Serial Number ถังที่รับคืน");
 
@@ -623,7 +874,7 @@ function DeliveryPage() {
       setShowCylinderModal(true);
       return;
     }
-    await sendApproveRequest(id, receivedSerialNumber);
+    sendApproveRequest(id, receivedSerialNumber);
   };
 
   const handleCreateAndApprove = () => {
@@ -640,28 +891,24 @@ function DeliveryPage() {
     sendApproveRequest(pendingApproveId, dataToSend.serial_number, dataToSend);
   };
 
-  const handleDelete = async (item) => {
+  // ====================================================
+  // Delete delivery
+  // ====================================================
+  const handleDelete = (item) => {
     const deliveryId = item.id || item.delivery_id;
     if (!deliveryId) return alert("ไม่พบรหัสงานจัดส่ง");
     if (!window.confirm(`คุณต้องการลบงานรหัส #${deliveryId} ใช่หรือไม่?`)) return;
 
-    try {
-      const res = await apiFetch(`${API_BASE_URL}/cylinder/delete_delivery.php`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ delivery_id: deliveryId }),
-      });
-
-      alert(res.message || (res.success ? "ลบข้อมูลสำเร็จ" : "ลบข้อมูลไม่สำเร็จ"));
-      if (res.success) {
-        setDeliveries((prev) => prev.filter((d) => (d.id || d.delivery_id) !== deliveryId));
-      }
-    } catch (err) {
-      console.error("Delete Error:", err);
-      alert("เกิดข้อผิดพลาดในการเชื่อมต่อ");
-    }
+    updateDb((draft) => {
+      draft.tables.delivery = (draft.tables.delivery || []).filter(
+        (d) => d.delivery_id !== deliveryId
+      );
+    });
   };
 
+  // ====================================================
+  // Visible deliveries (per role)
+  // ====================================================
   const availableStaffs = useMemo(() => staffs, [staffs]);
 
   const visibleDeliveries = useMemo(() => {
@@ -693,16 +940,13 @@ function DeliveryPage() {
 
       const isMyJob =
         (currentStaffId !== "" && dStaffId === currentStaffId) ||
-        (currentUsername !== "" && (dStaffName.includes(currentUsername) || currentUsername.includes(dStaffName)));
+        (currentUsername !== "" &&
+          (dStaffName.includes(currentUsername) || currentUsername.includes(dStaffName)));
 
-      const isUnassigned = !dStaffId || dStaffId === "0" || dStaffId === "null" || dStaffId === "";
+      const isUnassigned = !dStaffId || dStaffId === "0" || dStaffId === "null";
 
-      if (d.status === "pending") {
-        return isMyJob || isUnassigned;
-      }
-      if (d.status === "delivering") {
-        return true;
-      }
+      if (d.status === "pending") return isMyJob || isUnassigned;
+      if (d.status === "delivering") return true;
       return false;
     });
   }, [deliveries, role, username, staffId]);
@@ -730,13 +974,9 @@ function DeliveryPage() {
     );
   }, [deliveries, username, staffId]);
 
-  const maintenanceDueItems = cylinders.filter((c) => {
-    if (!c.nextCheckDate) return false;
-    return new Date(c.nextCheckDate) <= new Date();
-  });
-
-  const deliverySuccessItems = deliveries.filter((d) => d.status === "success");
-
+  // ====================================================
+  // Helpers: status
+  // ====================================================
   const getStatusStyle = (status) => {
     switch (status) {
       case "pending":
@@ -767,6 +1007,20 @@ function DeliveryPage() {
     }
   };
 
+  // ====================================================
+  // Sync label
+  // ====================================================
+  const syncLabel = () => {
+    if (!apiAvailable) return "⚠️ โหมดออฟไลน์ (บันทึกลง localStorage)";
+    if (syncStatus === "saving") return "⏳ กำลังบันทึก Data.json...";
+    if (syncStatus === "saved") return "✅ บันทึก Data.json แล้ว";
+    if (syncStatus === "error") return "❌ บันทึกไม่สำเร็จ";
+    return "(realtime auto-sync)";
+  };
+
+  // ====================================================
+  // Render
+  // ====================================================
   if (loading) {
     return (
       <Layout>
@@ -778,17 +1032,29 @@ function DeliveryPage() {
   }
 
   return (
-    <Layout
-      gasLevel={gasLevel}
-      maintenanceDueItems={maintenanceDueItems}
-      expiredCylinderItems={[]}
-      deliverySuccessItems={deliverySuccessItems}
-      newAssignedJobItems={[]}
-    >
+    <Layout>
       <div style={{ maxWidth: "800px", margin: "0 auto", padding: "0 12px 40px 12px" }}>
-        
+        {/* Sync status bar */}
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            alignItems: "center",
+            marginBottom: "8px",
+          }}
+        >
+          <span
+            style={{
+              color: apiAvailable ? "#22c55e" : "#f59e0b",
+              fontSize: "12px",
+            }}
+          >
+            {syncLabel()}
+          </span>
+        </div>
+
         {/* Card สร้างงานจัดส่ง (Admin) */}
-        {role === "admin" && (
+        {(role === "admin" || role === "ผู้ดูแลระบบ") && (
           <div style={styles.cardContainer}>
             <div style={styles.cardHeader}>
               <h2 style={{ margin: 0, fontSize: "1rem", fontWeight: "600", color: "#f8fafc" }}>
@@ -910,12 +1176,20 @@ function DeliveryPage() {
                       </option>
                     ))}
                   </select>
+                  {availableStaffs.length === 0 && (
+                    <div style={{ fontSize: "11px", color: "#f59e0b", marginTop: "4px" }}>
+                      ยังไม่มีข้อมูลพนักงานในระบบ
+                    </div>
+                  )}
                 </div>
               </div>
 
               <div style={{ marginTop: "16px" }}>
-                <button onClick={createDeliveryJob} style={{ ...styles.primaryBtn, width: "100%", padding: "10px", fontSize: "14px" }}>
-                  สร้างงานจัดส่ง 
+                <button
+                  onClick={createDeliveryJob}
+                  style={{ ...styles.primaryBtn, width: "100%", padding: "10px", fontSize: "14px" }}
+                >
+                  สร้างงานจัดส่ง
                 </button>
               </div>
             </div>
@@ -937,7 +1211,6 @@ function DeliveryPage() {
           {visibleDeliveries.length > 0 ? (
             visibleDeliveries.map((item) => (
               <div key={item.id} style={styles.jobCard}>
-                
                 {/* Header */}
                 <div style={styles.jobCardHeader}>
                   <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
@@ -947,16 +1220,16 @@ function DeliveryPage() {
                     </span>
                   </div>
 
-                  {role === "admin" && (item.status === "pending" || item.status === "delivering") && (
-                    <button onClick={() => handleDelete(item)} style={styles.dangerBtn}>
-                      🗑️ ลบ
-                    </button>
-                  )}
+                  {(role === "admin" || role === "ผู้ดูแลระบบ") &&
+                    (item.status === "pending" || item.status === "delivering") && (
+                      <button onClick={() => handleDelete(item)} style={styles.dangerBtn}>
+                        🗑️ ลบ
+                      </button>
+                    )}
                 </div>
 
-                {/* Body Details */}
+                {/* Body */}
                 <div style={styles.jobCardBody}>
-                  
                   {/* ลูกค้า */}
                   <div style={styles.infoRow}>
                     <span style={styles.iconSpan}> </span>
@@ -980,9 +1253,7 @@ function DeliveryPage() {
                   <div style={styles.specBox}>
                     <div style={{ fontSize: "12px", color: "#94a3b8", marginBottom: "4px" }}>สเปกแก๊ส:</div>
                     <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" }}>
-                      <span style={styles.specBadge}>
-                        {(item.req_brand || item.brand || "-")}
-                      </span>
+                      <span style={styles.specBadge}>{(item.req_brand || item.brand || "-")}</span>
                       <span style={styles.specBadge}>
                         {(item.req_gas_type || item.gasType || item.gas_type || "LPG")}
                       </span>
@@ -992,31 +1263,39 @@ function DeliveryPage() {
                     </div>
 
                     {(item.serial_number || item.deliveryCylinderId) && (
-                      <div style={{ marginTop: "8px", paddingTop: "8px", borderTop: "1px dashed #334155", fontSize: "13px" }}>
+                      <div
+                        style={{
+                          marginTop: "8px",
+                          paddingTop: "8px",
+                          borderTop: "1px dashed #334155",
+                          fontSize: "13px",
+                        }}
+                      >
                         <span style={{ color: "#94a3b8" }}>Serial ถังที่ส่ง: </span>
-                        <strong style={{ color: "#4ade80" }}>{item.serial_number || item.deliveryCylinderId}</strong>
+                        <strong style={{ color: "#4ade80" }}>
+                          {item.serial_number || item.deliveryCylinderId}
+                        </strong>
                       </div>
                     )}
                   </div>
 
-                  {/* พนักงานผู้รับผิดชอบ */}
+                  {/* พนักงาน */}
                   <div style={{ fontSize: "13px", color: "#94a3b8", display: "flex", alignItems: "center", gap: "6px" }}>
-                    
-                    <span>ผู้รับผิดชอบ: <strong style={{ color: "#e2e8f0" }}>{item.assignedStaff || "ไม่ระบุชื่อ"}</strong></span>
+                    <span>
+                      ผู้รับผิดชอบ: <strong style={{ color: "#e2e8f0" }}>{item.assignedStaff || "ไม่ระบุชื่อ"}</strong>
+                    </span>
                   </div>
 
-                  {/* Action Bar ปุ่มดำเนินการ */}
+                  {/* Actions */}
                   <div style={styles.jobCardActions}>
-                    
-                    {/* ปุ่มปักหมุด GPS */}
-                    {(!item.mapPin || item.mapPin === "-") ? (
+                    {!item.mapPin || item.mapPin === "-" ? (
                       <button
                         type="button"
                         onClick={() => handleSaveCurrentLocation(item)}
                         disabled={gettingLocationId === item.id}
                         style={styles.gpsPinBtn}
                       >
-                       {gettingLocationId === item.id ? "กำลังบันทึกพิกัด..." : "ปักหมุดตำแหน่งปัจจุบัน"}
+                        {gettingLocationId === item.id ? "กำลังบันทึกพิกัด..." : "ปักหมุดตำแหน่งปัจจุบัน"}
                       </button>
                     ) : (
                       <a
@@ -1034,7 +1313,10 @@ function DeliveryPage() {
                       <div style={{ width: "100%", marginTop: "6px" }}>
                         {scanningJobId === item.id ? (
                           <div style={{ textAlign: "center" }}>
-                            <div id="qr-reader-container" style={{ width: "100%", background: "#fff", borderRadius: "8px", overflow: "hidden" }}></div>
+                            <div
+                              id="qr-reader-container"
+                              style={{ width: "100%", background: "#fff", borderRadius: "8px", overflow: "hidden" }}
+                            ></div>
                             <button
                               onClick={() => setScanningJobId(null)}
                               style={{ ...styles.secondaryBtn, width: "100%", marginTop: "8px" }}
@@ -1044,13 +1326,25 @@ function DeliveryPage() {
                           </div>
                         ) : (
                           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                            <button onClick={() => setScanningJobId(item.id)} style={{ ...styles.secondaryBtn, background: "#0284c7" }}>
-                             สแกน QR Code ถัง
+                            <button
+                              onClick={() => setScanningJobId(item.id)}
+                              style={{ ...styles.secondaryBtn, background: "#0284c7" }}
+                            >
+                              สแกน QR Code ถัง
                             </button>
 
                             {confirmCylinderInputs[item.id] && (
-                              <div style={{ background: "#0f172a", padding: "8px", borderRadius: "6px", fontSize: "12px", textAlign: "center" }}>
-                                Serial ที่สแกน: <strong style={{ color: "#4ade80" }}>{confirmCylinderInputs[item.id]}</strong>
+                              <div
+                                style={{
+                                  background: "#0f172a",
+                                  padding: "8px",
+                                  borderRadius: "6px",
+                                  fontSize: "12px",
+                                  textAlign: "center",
+                                }}
+                              >
+                                Serial ที่สแกน:{" "}
+                                <strong style={{ color: "#4ade80" }}>{confirmCylinderInputs[item.id]}</strong>
                               </div>
                             )}
 
@@ -1063,7 +1357,7 @@ function DeliveryPage() {
                                 cursor: confirmCylinderInputs[item.id] ? "pointer" : "not-allowed",
                               }}
                             >
-                            ยืนยันรับงานส่ง
+                              ยืนยันรับงานส่ง
                             </button>
                           </div>
                         )}
@@ -1077,7 +1371,7 @@ function DeliveryPage() {
                           onClick={() => setSelectedProofId(selectedProofId === item.id ? null : item.id)}
                           style={styles.cameraBtn}
                         >
-                        ถ่ายรูปถังที่รับคืน
+                          ถ่ายรูปถังที่รับคืน
                         </button>
                         {selectedProofId === item.id && (
                           <div style={{ marginTop: "8px" }}>
@@ -1094,14 +1388,18 @@ function DeliveryPage() {
                     )}
 
                     {/* Admin: อนุมัติงาน */}
-                    {role === "admin" && item.status === "pending_approval" && (
-                      <div style={{ width: "100%", display: "flex", flexDirection: "column", gap: "8px", marginTop: "6px" }}>
+                    {(role === "admin" || role === "ผู้ดูแลระบบ") && item.status === "pending_approval" && (
+                      <div
+                        style={{
+                          width: "100%",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: "8px",
+                          marginTop: "6px",
+                        }}
+                      >
                         {item.proofImagePath && (
-                          <img
-                            src={`${UPLOADS_BASE_URL}/${item.proofImagePath}`}
-                            alt="proof"
-                            style={styles.proofImgPreview}
-                          />
+                          <img src={item.proofImagePath} alt="proof" style={styles.proofImgPreview} />
                         )}
                         <input
                           type="text"
@@ -1115,12 +1413,14 @@ function DeliveryPage() {
                           }
                           style={styles.input}
                         />
-                        <button onClick={() => approveDelivery(item.id)} style={{ ...styles.primaryBtn, background: "#16a34a" }}>
+                        <button
+                          onClick={() => approveDelivery(item.id)}
+                          style={{ ...styles.primaryBtn, background: "#16a34a" }}
+                        >
                           อนุมัติงานส่ง
                         </button>
                       </div>
                     )}
-
                   </div>
                 </div>
               </div>
@@ -1189,7 +1489,9 @@ function DeliveryPage() {
             <div style={styles.modalBody}>
               <h3 style={{ marginTop: 0, color: "#fff", fontSize: "16px" }}>➕ เพิ่มถังใหม่เข้าระบบ</h3>
               <p style={{ fontSize: "13px", color: "#94a3b8" }}>
-                ไม่พบ Serial Number <strong style={{ color: "#facc15" }}>{newCylinderForApproval.serial_number}</strong> ในฐานข้อมูล
+                ไม่พบ Serial Number{" "}
+                <strong style={{ color: "#facc15" }}>{newCylinderForApproval.serial_number}</strong>{" "}
+                ในฐานข้อมูล
               </p>
 
               <div style={{ display: "flex", flexDirection: "column", gap: "10px", marginTop: "12px" }}>
@@ -1197,7 +1499,12 @@ function DeliveryPage() {
                   <label style={styles.label}>Serial Number *</label>
                   <input
                     value={newCylinderForApproval.serial_number}
-                    onChange={(e) => setNewCylinderForApproval({ ...newCylinderForApproval, serial_number: e.target.value })}
+                    onChange={(e) =>
+                      setNewCylinderForApproval({
+                        ...newCylinderForApproval,
+                        serial_number: e.target.value,
+                      })
+                    }
                     style={styles.input}
                   />
                 </div>
@@ -1205,7 +1512,9 @@ function DeliveryPage() {
                   <label style={styles.label}>ยี่ห้อ *</label>
                   <select
                     value={newCylinderForApproval.brand}
-                    onChange={(e) => setNewCylinderForApproval({ ...newCylinderForApproval, brand: e.target.value })}
+                    onChange={(e) =>
+                      setNewCylinderForApproval({ ...newCylinderForApproval, brand: e.target.value })
+                    }
                     style={styles.select}
                   >
                     <option value="">-- เลือกยี่ห้อ --</option>
@@ -1218,7 +1527,9 @@ function DeliveryPage() {
                   <label style={styles.label}>ชนิดแก๊ส</label>
                   <select
                     value={newCylinderForApproval.gas_type}
-                    onChange={(e) => setNewCylinderForApproval({ ...newCylinderForApproval, gas_type: e.target.value })}
+                    onChange={(e) =>
+                      setNewCylinderForApproval({ ...newCylinderForApproval, gas_type: e.target.value })
+                    }
                     style={styles.select}
                   >
                     <option value="LPG">LPG</option>
@@ -1228,7 +1539,9 @@ function DeliveryPage() {
                   <label style={styles.label}>ขนาดถัง *</label>
                   <select
                     value={newCylinderForApproval.size}
-                    onChange={(e) => setNewCylinderForApproval({ ...newCylinderForApproval, size: e.target.value })}
+                    onChange={(e) =>
+                      setNewCylinderForApproval({ ...newCylinderForApproval, size: e.target.value })
+                    }
                     style={styles.select}
                   >
                     <option value="">-- เลือกขนาด --</option>
@@ -1268,12 +1581,14 @@ function DeliveryPage() {
             </div>
           </div>
         )}
-
       </div>
     </Layout>
   );
 }
 
+// ====================================================
+// Styles
+// ====================================================
 const styles = {
   cardContainer: {
     background: "#1e293b",
@@ -1486,10 +1801,11 @@ const styles = {
   },
   proofImgPreview: {
     width: "100%",
-    maxHeight: "140px",
-    objectFit: "cover",
+    maxHeight: "220px",
+    objectFit: "contain",
     borderRadius: "6px",
     border: "1px solid #334155",
+    background: "#0f172a",
   },
   modalOverlay: {
     position: "fixed",
