@@ -1,16 +1,20 @@
+// vite.config.js
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
   server: {
-    host: true,
     proxy: {
-      '/Backend': {
-        target: 'http://localhost:8080',
+      '/api': {
+        target: 'https://gas-db.infinityfree.io',
         changeOrigin: true,
-        secure: false
-      }
-    }
-  }
+        rewrite: (path) => path.replace(/^\/api/, ''),
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json, text/plain, */*',
+        }
+      },
+    },
+  },
 })
