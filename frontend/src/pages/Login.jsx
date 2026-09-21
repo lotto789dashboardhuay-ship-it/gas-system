@@ -1,37 +1,38 @@
 import React, { useState } from 'react';
 
 // ------------------------------------------------------------
-// Helper: ตรวจสอบ Content-Type ก่อน parse JSON
-// ถ้า server ส่ง HTML (anti-bot challenge) จะ throw error ที่อ่านรู้เรื่อง
+// Mock Database (คัดลอกจากไฟล์ JSON ที่ export มา)
 // ------------------------------------------------------------
-const safeFetch = async (url, options = {}) => {
-  const response = await fetch(url, options);
+const MOCK_DB = {
+  admin: [
+    {
+      admin_id: 1,
+      username: 'admin',
+      name_admin: 'ผู้ดูแลระบบ',
+      name: null,
+      role: 'admin',
+      status: 'active',
+      last_login: null,
+    },
+  ],
+  delivery_staff: [
+    {
+      staff_id: 1,
+      staff_name: 'พนักงานส่งคนที่ 1',
+      staff_phone: '0812345678',
+      username: 'staff1',
+      address: 'ที่อยู่พนักงาน',
+      status: 'active',
+      last_login: null,
+    },
+  ],
+};
 
-  const contentType = response.headers.get('content-type') || '';
-
-  // ถ้าไม่ใช่ JSON ให้อ่านเป็น text แล้ว throw error พร้อมข้อความจาก server
-  if (!contentType.includes('application/json')) {
-    const text = await response.text();
-    const preview = text.slice(0, 200).replace(/\s+/g, ' ');
-    throw new Error(
-      `Server ตอบกลับเป็น ${contentType || 'unknown'} ไม่ใช่ JSON ` +
-      `(อาจติด anti-bot ของ InfinityFree) — ตัวอย่าง: ${preview}...`
-    );
-  }
-
-  // ถ้า HTTP status ไม่ใช่ 2xx ให้พยายาม parse error message
-  if (!response.ok) {
-    let errorMessage = `HTTP ${response.status}`;
-    try {
-      const errData = await response.json();
-      errorMessage = errData.message || errorMessage;
-    } catch {
-      // ignore
-    }
-    throw new Error(errorMessage);
-  }
-
-  return response.json();
+// เพราะ JSON ไม่มีฟิลด์ password → กำหนด mock password ไว้ตรงนี้
+// key = username, value = password
+const MOCK_PASSWORDS = {
+  admin: 'admin123',
+  staff1: 'staff123',
 };
 
 // ------------------------------------------------------------
@@ -48,48 +49,62 @@ const Login = () => {
     setErrorMessage('');
     setLoading(true);
 
+    // จำลองดีเลย์นิดหน่อยให้เหมือนยิง API จริง
+    await new Promise((r) => setTimeout(r, 400));
+
     try {
-      // ✅ ใช้ safeFetch แทน fetch ธรรมดา
-      const result = await safeFetch('/api/Backend/models/login.php', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          // ถ้า backend ต้องการ cookie สำหรับ anti-bot ให้เพิ่ม credentials
-          // 'credentials': 'include',
-        },
-        body: JSON.stringify({
-          username: username.trim(),
-          password: password.trim(),
-        }),
-      });
+      const u = username.trim();
+      const p = password.trim();
 
-      if (result && result.success) {
-        const displayName = result.name || result.staff_name || result.username;
+      // 1) หาในตาราง admin ก่อน
+      const admin = MOCK_DB.admin.find(
+        (a) => a.username === u && a.status === 'active'
+      );
 
-        const userData = {
-          ...result,
-          name: displayName,
-          staff_name: displayName,
-        };
+      // 2) ถ้าไม่เจอ หาในตาราง delivery_staff
+      const staff = MOCK_DB.delivery_staff.find(
+        (s) => s.username === u && s.status === 'active'
+      );
 
-        localStorage.setItem('user', JSON.stringify(userData));
-        localStorage.setItem('userName', displayName);
-        localStorage.setItem('name', displayName);
-        localStorage.setItem('role', result.role);
-        localStorage.setItem('isLoggedIn', 'true');
+      const found = admin || staff;
 
-        if (result.role === 'admin') {
-          window.location.href = '/staff';
-        } else {
-          window.location.href = '/delivery';
-        }
+      // ไม่พบ user หรือรหัสผ่านไม่ตรง
+      if (!found || MOCK_PASSWORDS[u] !== p) {
+        setErrorMessage('ชื่อผู้ใช้งานหรือรหัสผ่านไม่ถูกต้อง');
+        return;
+      }
+
+      // --------- สร้าง userData ให้เหมือน response จาก API เดิม ---------
+      const isAdmin = !!admin;
+      const displayName = isAdmin
+        ? admin.name_admin || admin.name || admin.username
+        : staff.staff_name || staff.username;
+
+      const userData = {
+        success: true,
+        role: isAdmin ? 'admin' : 'staff',
+        username: u,
+        name: displayName,
+        staff_name: displayName,
+        // เก็บ id ต้นทางไว้เผื่อใช้ต่อ
+        admin_id: isAdmin ? admin.admin_id : undefined,
+        staff_id: !isAdmin ? staff.staff_id : undefined,
+      };
+
+      localStorage.setItem('user', JSON.stringify(userData));
+      localStorage.setItem('userName', displayName);
+      localStorage.setItem('name', displayName);
+      localStorage.setItem('role', userData.role);
+      localStorage.setItem('isLoggedIn', 'true');
+
+      if (userData.role === 'admin') {
+        window.location.href = '/staff';
       } else {
-        setErrorMessage(result.message || 'ชื่อผู้ใช้งานหรือรหัสผ่านไม่ถูกต้อง');
+        window.location.href = '/delivery';
       }
     } catch (error) {
       console.error('Login Error:', error);
-      // แสดงข้อความที่ safeFetch แจ้งไว้ (อ่านรู้เรื่องกว่าของเดิม)
-      setErrorMessage(error.message || 'ไม่สามารถเชื่อมต่อกับเซิร์ฟเวอร์ได้');
+      setErrorMessage(error.message || 'เกิดข้อผิดพลาดในการเข้าสู่ระบบ');
     } finally {
       setLoading(false);
     }
@@ -101,18 +116,20 @@ const Login = () => {
         <div style={styles.header}>
           <div style={styles.icon}>🔥</div>
           <h2 style={styles.title}>Gas Management System</h2>
-          <p style={styles.subtitle}>เข้าสู่ระบบเพื่อจัดการคลังและระบบจัดส่งแก๊ส</p>
+          <p style={styles.subtitle}>
+            เข้าสู่ระบบเพื่อจัดการคลังและระบบจัดส่งแก๊ส
+          </p>
         </div>
 
         {errorMessage && (
-          <div style={styles.errorBanner}>
-            ⚠️ {errorMessage}
-          </div>
+          <div style={styles.errorBanner}>⚠️ {errorMessage}</div>
         )}
 
         <form onSubmit={handleLogin} style={styles.form}>
           <div style={styles.formGroup}>
-            <label htmlFor="username" style={styles.label}>ชื่อผู้ใช้งาน (Username)</label>
+            <label htmlFor="username" style={styles.label}>
+              ชื่อผู้ใช้งาน (Username)
+            </label>
             <input
               id="username"
               type="text"
@@ -125,7 +142,9 @@ const Login = () => {
           </div>
 
           <div style={styles.formGroup}>
-            <label htmlFor="password" style={styles.label}>รหัสผ่าน (Password)</label>
+            <label htmlFor="password" style={styles.label}>
+              รหัสผ่าน (Password)
+            </label>
             <input
               id="password"
               type="password"
@@ -141,6 +160,7 @@ const Login = () => {
             {loading ? 'กำลังเข้าสู่ระบบ...' : 'เข้าสู่ระบบ'}
           </button>
         </form>
+
       </div>
     </div>
   );
@@ -171,10 +191,7 @@ const styles = {
     padding: '2.5rem 2rem',
     boxSizing: 'border-box',
   },
-  header: {
-    textAlign: 'center',
-    marginBottom: '1.5rem',
-  },
+  header: { textAlign: 'center', marginBottom: '1.5rem' },
   icon: {
     fontSize: '2.5rem',
     background: '#ffedd5',
@@ -192,11 +209,7 @@ const styles = {
     fontWeight: '600',
     margin: '0 0 0.5rem 0',
   },
-  subtitle: {
-    color: '#64748b',
-    fontSize: '0.875rem',
-    margin: 0,
-  },
+  subtitle: { color: '#64748b', fontSize: '0.875rem', margin: 0 },
   errorBanner: {
     backgroundColor: '#fef2f2',
     borderLeft: '4px solid #ef4444',
@@ -206,22 +219,9 @@ const styles = {
     fontSize: '0.875rem',
     marginBottom: '1.25rem',
   },
-  form: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '1.25rem',
-  },
-  formGroup: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.4rem',
-    textAlign: 'left',
-  },
-  label: {
-    color: '#334155',
-    fontSize: '0.875rem',
-    fontWeight: '500',
-  },
+  form: { display: 'flex', flexDirection: 'column', gap: '1.25rem' },
+  formGroup: { display: 'flex', flexDirection: 'column', gap: '0.4rem', textAlign: 'left' },
+  label: { color: '#334155', fontSize: '0.875rem', fontWeight: '500' },
   input: {
     width: '100%',
     padding: '0.75rem 1rem',
@@ -243,6 +243,15 @@ const styles = {
     fontWeight: '500',
     cursor: 'pointer',
     marginTop: '0.5rem',
+  },
+  hint: {
+    marginTop: '1rem',
+    padding: '0.75rem 1rem',
+    background: '#f1f5f9',
+    borderRadius: '8px',
+    fontSize: '0.8rem',
+    color: '#475569',
+    lineHeight: 1.5,
   },
 };
 
