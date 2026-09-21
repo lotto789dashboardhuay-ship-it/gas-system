@@ -1,5 +1,4 @@
-import { API_BASE } from "../config";
-import { useState, useEffect } from "react";
+import { useMemo } from "react";
 import Layout from "../components/Layout";
 import {
   LineChart,
@@ -14,97 +13,157 @@ import {
   ResponsiveContainer,
 } from "recharts";
 
+// ------------------------------------------------------------
+// Mock DB (จากไฟล์ Data.json ที่ export มา)
+// ------------------------------------------------------------
+import mockDb from "../pages/Data.json";
+
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
+const TODAY = new Date();
+
+// ดึงตารางออกมาจาก json
+const getTables = (db) => db?.tables || {};
+
+// นับจำนวนวันระหว่าง 2 วันที่
+const daysBetween = (a, b) =>
+  Math.ceil((a.getTime() - b.getTime()) / (1000 * 60 * 60 * 24));
+
+// ---------- 1) Summary cards ----------
+const computeSummary = (db) => {
+  const cylinders = getTables(db).gas_cylinder || [];
+
+  const total_cylinders = cylinders.length;
+
+  const in_stock = cylinders.filter((c) => c.status === "ในคลัง").length;
+
+  const expired = cylinders.filter((c) => {
+    if (!c.expiry_date) return false;
+    return new Date(c.expiry_date) < TODAY;
+  }).length;
+
+  const ready = cylinders.filter((c) => {
+    if (!c.expiry_date) return false;
+    return c.status === "ในคลัง" && new Date(c.expiry_date) >= TODAY;
+  }).length;
+
+  return { total_cylinders, in_stock, ready, expired };
+};
+
+// ---------- 2) Topbar stats ----------
+const computeTopbarStats = (db) => {
+  const t = getTables(db);
+  const storage = t.gas_storage || [];
+  const maintenance = t.maintenance || [];
+  const cylinders = t.gas_cylinder || [];
+  const delivery = t.delivery || [];
+
+  // gasLevel = % เฉลี่ยของถังเก็บ (ถ้าไม่มีข้อมูลให้ 0)
+  const gasLevel = storage.length
+    ? Math.round(
+        storage.reduce((sum, s) => sum + (Number(s.level) || 0), 0) /
+          storage.length
+      )
+    : 0;
+
+  // maintenance ที่ยังไม่เสร็จ
+  const maintenanceCount = maintenance.filter(
+    (m) => m.status !== "done" && m.status !== "completed"
+  ).length;
+
+  // ถังที่หมดอายุแล้ว
+  const expiredCount = cylinders.filter(
+    (c) => c.expiry_date && new Date(c.expiry_date) < TODAY
+  ).length;
+
+  // delivery ที่สำเร็จ
+  const successCount = delivery.filter(
+    (d) => d.status === "delivered" || d.status === "success"
+  ).length;
+
+  return { gasLevel, maintenanceCount, expiredCount, successCount };
+};
+
+// ---------- 3) รอบส่งของพนักงาน ----------
+const computeStaffRounds = (db) => {
+  const t = getTables(db);
+  const delivery = t.delivery || [];
+  const staffList = t.delivery_staff || [];
+
+  const counts = {};
+  delivery.forEach((d) => {
+    const name =
+      d.staff_name ||
+      staffList.find((s) => s.staff_id === d.staff_id)?.staff_name ||
+      "-";
+    counts[name] = (counts[name] || 0) + 1;
+  });
+
+  return Object.entries(counts)
+    .map(([staff_name, count]) => ({ staff_name, count }))
+    .sort((a, b) => b.count - a.count);
+};
+
+// ---------- 4) ถังใกล้ถึงกำหนดตรวจ (ภายใน 30 วัน) ----------
+const computeNearDue = (db) => {
+  const cylinders = getTables(db).gas_cylinder || [];
+
+  return cylinders
+    .filter((c) => c.next_check_date)
+    .map((c) => ({
+      cylinder_id: c.cylinder_id,
+      serial_number: c.serial_number,
+      next_check_date: c.next_check_date,
+      days_left: daysBetween(new Date(c.next_check_date), TODAY),
+    }))
+    .filter((c) => c.days_left <= 30)
+    .sort((a, b) => a.days_left - b.days_left);
+};
+
+// ---------- 5) กราฟจำนวนถังแยกตามประเภทแก๊ส ----------
+const computeGasTypeChart = (db) => {
+  const cylinders = getTables(db).gas_cylinder || [];
+
+  const counts = {};
+  cylinders.forEach((c) => {
+    const type = c.gas_type || "ไม่ระบุ";
+    counts[type] = (counts[type] || 0) + 1;
+  });
+
+  return Object.entries(counts).map(([gas_type, total]) => ({
+    gas_type,
+    total,
+  }));
+};
+
+// ---------- 6) กราฟออเดอร์รายวัน ----------
+const computeDeliveryChart = (db) => {
+  const delivery = getTables(db).delivery || [];
+
+  const counts = {};
+  delivery.forEach((d) => {
+    const day = (d.delivered_date || d.created_at || "").slice(0, 10);
+    if (!day) return;
+    counts[day] = (counts[day] || 0) + 1;
+  });
+
+  return Object.entries(counts)
+    .map(([delivery_day, total_orders]) => ({ delivery_day, total_orders }))
+    .sort((a, b) => a.delivery_day.localeCompare(b.delivery_day));
+};
+
+// ------------------------------------------------------------
+// Component
+// ------------------------------------------------------------
 function Dashboard() {
-  const [summary, setSummary] = useState({
-    total_cylinders: 0,
-    in_stock: 0,
-    ready: 0,
-    expired: 0,
-  });
-
-  // State สำหรับเก็บข้อมูลแจ้งเตือน TopBar
-  const [topbarStats, setTopbarStats] = useState({
-    gasLevel: 0,
-    maintenanceCount: 0,
-    expiredCount: 0,
-    successCount: 0,
-  });
-
-  const [staffRounds, setStaffRounds] = useState([]);
-  const [nearDueCylinders, setNearDueCylinders] = useState([]);
-  const [gasTypeData, setGasTypeData] = useState([]);
-  const [deliveryChartData, setDeliveryChartData] = useState([]);
-
-  // ฟังก์ชันช่วย Safe Fetch JSON
-  const safeFetchJson = async (url) => {
-    try {
-      const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error(`HTTP error! status: ${res.status}`);
-      }
-      const text = await res.text();
-      try {
-        return JSON.parse(text);
-      } catch (e) {
-        console.warn(`JSON Parse error at [${url}]:`, text);
-        return null;
-      }
-    } catch (err) {
-      console.error(`Fetch error at [${url}]:`, err);
-      return null;
-    }
-  };
-
-  // ดึงข้อมูลสำหรับ TopBar Notifications
-  const fetchTopbarStats = async () => {
-    const data = await safeFetchJson(`${API_BASE}/get_topbar_stats.php`);
-    if (data && data.success) {
-      setTopbarStats({
-        gasLevel: data.gasLevel || 0,
-        maintenanceCount: data.maintenanceCount || 0,
-        expiredCount: data.expiredCount || 0,
-        successCount: data.successCount || 0,
-      });
-    }
-  };
-
-  const fetchSummary = async () => {
-    const data = await safeFetchJson(`${API_BASE}/get_dashboard_summary.php`);
-    if (data && data.success) setSummary(data.data);
-  };
-
-  const fetchStaffRounds = async () => {
-    const data = await safeFetchJson(`${API_BASE}/get_staff_delivery_rounds.php`);
-    if (data && data.success) setStaffRounds(data.data);
-  };
-
-  const fetchNearDueCylinders = async () => {
-    const data = await safeFetchJson(`${API_BASE}/get_near_due_cylinders.php`);
-    if (data && data.success) setNearDueCylinders(data.data);
-  };
-
-  const fetchGasTypeChart = async () => {
-    const data = await safeFetchJson(`${API_BASE}/get_gas_type_chart.php`);
-    if (data && data.success) setGasTypeData(data.data);
-  };
-
-  const fetchDeliveryChart = async () => {
-    const data = await safeFetchJson(`${API_BASE}/get_delivery_chart.php`);
-    if (data && data.success) setDeliveryChartData(data.data);
-  };
-
-  useEffect(() => {
-    fetchTopbarStats();
-    fetchSummary();
-    fetchStaffRounds();
-    fetchNearDueCylinders();
-    fetchGasTypeChart();
-    fetchDeliveryChart();
-
-    // ดึงข้อมูลอัปเดตแจ้งเตือนทุก 5 วินาที
-    const interval = setInterval(fetchTopbarStats, 5000);
-    return () => clearInterval(interval);
-  }, []);
+  // คำนวณข้อมูลจาก mockDb ครั้งเดียว (ข้อมูล static)
+  const summary = useMemo(() => computeSummary(mockDb), []);
+  const topbarStats = useMemo(() => computeTopbarStats(mockDb), []);
+  const staffRounds = useMemo(() => computeStaffRounds(mockDb), []);
+  const nearDueCylinders = useMemo(() => computeNearDue(mockDb), []);
+  const gasTypeData = useMemo(() => computeGasTypeChart(mockDb), []);
+  const deliveryChartData = useMemo(() => computeDeliveryChart(mockDb), []);
 
   return (
     <Layout
@@ -131,19 +190,17 @@ function Dashboard() {
           ) : (
             <ResponsiveContainer width="100%" height={200}>
               <BarChart data={gasTypeData}>
-                <YAxis 
-                  axisLine={false} 
-                  tickLine={false} 
-                  tick={{ fill: "#9ca3af", fontSize: 12 }} 
+                <YAxis
+                  axisLine={false}
+                  tickLine={false}
+                  tick={{ fill: "#9ca3af", fontSize: 12 }}
                 />
-                
-                <XAxis 
-                  dataKey="gas_type" 
-                  axisLine={false} 
-                  tickLine={false} 
-                  tick={{ fill: "#9ca3af", fontSize: 12 }} 
+                <XAxis
+                  dataKey="gas_type"
+                  axisLine={false}
+                  tickLine={false}
+                  tick={{ fill: "#9ca3af", fontSize: 12 }}
                 />
-                
                 <Tooltip />
                 <Bar dataKey="total" fill="#2563eb" radius={[4, 4, 0, 0]} />
               </BarChart>
@@ -160,7 +217,11 @@ function Dashboard() {
             <ResponsiveContainer width="100%" height={320}>
               <LineChart data={deliveryChartData}>
                 <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="delivery_day" axisLine={false} tickLine={false} />
+                <XAxis
+                  dataKey="delivery_day"
+                  axisLine={false}
+                  tickLine={false}
+                />
                 <YAxis axisLine={false} tickLine={false} />
                 <Tooltip />
                 <Legend />
@@ -214,9 +275,17 @@ function Dashboard() {
               ) : (
                 nearDueCylinders.map((item, index) => (
                   <tr key={item.cylinder_id || item.serial_number || index}>
-                    <td style={tdStyle}>{item.serial_number || item.cylinder_id || "-"}</td>
+                    <td style={tdStyle}>
+                      {item.serial_number || item.cylinder_id || "-"}
+                    </td>
                     <td style={tdStyle}>{item.next_check_date || "-"}</td>
-                    <td style={{ ...tdStyle, color: (item.days_left || 0) <= 0 ? "#ef4444" : "#f59e0b" }}>
+                    <td
+                      style={{
+                        ...tdStyle,
+                        color:
+                          (item.days_left || 0) <= 0 ? "#ef4444" : "#f59e0b",
+                      }}
+                    >
                       {item.days_left ?? "-"} วัน
                     </td>
                   </tr>
@@ -230,6 +299,9 @@ function Dashboard() {
   );
 }
 
+// ------------------------------------------------------------
+// Sub-component + Styles
+// ------------------------------------------------------------
 const Card = ({ title, value }) => (
   <div style={summaryCardStyle}>
     <div>{title}</div>
@@ -239,13 +311,42 @@ const Card = ({ title, value }) => (
 
 const pageStyle = { padding: "24px", color: "white" };
 const titleStyle = { fontSize: "32px", marginBottom: "20px" };
-const cardGridStyle = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "16px", marginBottom: "20px" };
-const summaryCardStyle = { background: "#1f2937", padding: "16px", borderRadius: "12px" };
-const panelStyle = { background: "#1f2937", padding: "20px", borderRadius: "12px", marginBottom: "20px" };
+const cardGridStyle = {
+  display: "grid",
+  gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+  gap: "16px",
+  marginBottom: "20px",
+};
+const summaryCardStyle = {
+  background: "#1f2937",
+  padding: "16px",
+  borderRadius: "12px",
+};
+const panelStyle = {
+  background: "#1f2937",
+  padding: "20px",
+  borderRadius: "12px",
+  marginBottom: "20px",
+};
 const panelTitleStyle = { marginBottom: "16px" };
-const emptyTextStyle = { color: "#cbd5e1", textAlign: "center", padding: "40px" };
-const listRowStyle = { display: "flex", justifyContent: "space-between", padding: "10px", background: "#111827", borderRadius: "8px", marginBottom: "8px" };
-const tableStyle = { width: "100%", borderCollapse: "collapse", textAlign: "left" };
+const emptyTextStyle = {
+  color: "#cbd5e1",
+  textAlign: "center",
+  padding: "40px",
+};
+const listRowStyle = {
+  display: "flex",
+  justifyContent: "space-between",
+  padding: "10px",
+  background: "#111827",
+  borderRadius: "8px",
+  marginBottom: "8px",
+};
+const tableStyle = {
+  width: "100%",
+  borderCollapse: "collapse",
+  textAlign: "left",
+};
 const thStyle = { padding: "12px", borderBottom: "1px solid #374151" };
 const tdStyle = { padding: "12px", borderBottom: "1px solid #374151" };
 
