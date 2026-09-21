@@ -1,5 +1,42 @@
 import React, { useState } from 'react';
 
+// ------------------------------------------------------------
+// Helper: ตรวจสอบ Content-Type ก่อน parse JSON
+// ถ้า server ส่ง HTML (anti-bot challenge) จะ throw error ที่อ่านรู้เรื่อง
+// ------------------------------------------------------------
+const safeFetch = async (url, options = {}) => {
+  const response = await fetch(url, options);
+
+  const contentType = response.headers.get('content-type') || '';
+
+  // ถ้าไม่ใช่ JSON ให้อ่านเป็น text แล้ว throw error พร้อมข้อความจาก server
+  if (!contentType.includes('application/json')) {
+    const text = await response.text();
+    const preview = text.slice(0, 200).replace(/\s+/g, ' ');
+    throw new Error(
+      `Server ตอบกลับเป็น ${contentType || 'unknown'} ไม่ใช่ JSON ` +
+      `(อาจติด anti-bot ของ InfinityFree) — ตัวอย่าง: ${preview}...`
+    );
+  }
+
+  // ถ้า HTTP status ไม่ใช่ 2xx ให้พยายาม parse error message
+  if (!response.ok) {
+    let errorMessage = `HTTP ${response.status}`;
+    try {
+      const errData = await response.json();
+      errorMessage = errData.message || errorMessage;
+    } catch {
+      // ignore
+    }
+    throw new Error(errorMessage);
+  }
+
+  return response.json();
+};
+
+// ------------------------------------------------------------
+// Component
+// ------------------------------------------------------------
 const Login = () => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -12,10 +49,13 @@ const Login = () => {
     setLoading(true);
 
     try {
-      const response = await fetch('https://gas-db.infinityfree.io/Backend/models/login.php', {
+      // ✅ ใช้ safeFetch แทน fetch ธรรมดา
+      const result = await safeFetch('/api/Backend/models/login.php', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          // ถ้า backend ต้องการ cookie สำหรับ anti-bot ให้เพิ่ม credentials
+          // 'credentials': 'include',
         },
         body: JSON.stringify({
           username: username.trim(),
@@ -23,15 +63,13 @@ const Login = () => {
         }),
       });
 
-      const result = await response.json();
-
       if (result && result.success) {
         const displayName = result.name || result.staff_name || result.username;
 
         const userData = {
           ...result,
           name: displayName,
-          staff_name: displayName
+          staff_name: displayName,
         };
 
         localStorage.setItem('user', JSON.stringify(userData));
@@ -39,7 +77,7 @@ const Login = () => {
         localStorage.setItem('name', displayName);
         localStorage.setItem('role', result.role);
         localStorage.setItem('isLoggedIn', 'true');
-        
+
         if (result.role === 'admin') {
           window.location.href = '/staff';
         } else {
@@ -50,7 +88,8 @@ const Login = () => {
       }
     } catch (error) {
       console.error('Login Error:', error);
-      setErrorMessage('ไม่สามารถเชื่อมต่อกับเซิร์ฟเวอร์ได้');
+      // แสดงข้อความที่ safeFetch แจ้งไว้ (อ่านรู้เรื่องกว่าของเดิม)
+      setErrorMessage(error.message || 'ไม่สามารถเชื่อมต่อกับเซิร์ฟเวอร์ได้');
     } finally {
       setLoading(false);
     }
@@ -121,7 +160,7 @@ const styles = {
     position: 'fixed',
     top: 0,
     left: 0,
-    fontFamily: 'sans-serif'
+    fontFamily: 'sans-serif',
   },
   card: {
     background: '#ffffff',
@@ -130,11 +169,11 @@ const styles = {
     borderRadius: '16px',
     boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.3)',
     padding: '2.5rem 2rem',
-    boxSizing: 'border-box'
+    boxSizing: 'border-box',
   },
   header: {
     textAlign: 'center',
-    marginBottom: '1.5rem'
+    marginBottom: '1.5rem',
   },
   icon: {
     fontSize: '2.5rem',
@@ -145,18 +184,18 @@ const styles = {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    margin: '0 auto 1rem auto'
+    margin: '0 auto 1rem auto',
   },
   title: {
     color: '#0f172a',
     fontSize: '1.4rem',
     fontWeight: '600',
-    margin: '0 0 0.5rem 0'
+    margin: '0 0 0.5rem 0',
   },
   subtitle: {
     color: '#64748b',
     fontSize: '0.875rem',
-    margin: 0
+    margin: 0,
   },
   errorBanner: {
     backgroundColor: '#fef2f2',
@@ -165,23 +204,23 @@ const styles = {
     padding: '0.75rem 1rem',
     borderRadius: '6px',
     fontSize: '0.875rem',
-    marginBottom: '1.25rem'
+    marginBottom: '1.25rem',
   },
   form: {
     display: 'flex',
     flexDirection: 'column',
-    gap: '1.25rem'
+    gap: '1.25rem',
   },
   formGroup: {
     display: 'flex',
     flexDirection: 'column',
     gap: '0.4rem',
-    textAlign: 'left'
+    textAlign: 'left',
   },
   label: {
     color: '#334155',
     fontSize: '0.875rem',
-    fontWeight: '500'
+    fontWeight: '500',
   },
   input: {
     width: '100%',
@@ -191,7 +230,7 @@ const styles = {
     fontSize: '1rem',
     outline: 'none',
     boxSizing: 'border-box',
-    backgroundColor: '#f8fafc'
+    backgroundColor: '#f8fafc',
   },
   button: {
     width: '100%',
@@ -203,8 +242,8 @@ const styles = {
     fontSize: '1rem',
     fontWeight: '500',
     cursor: 'pointer',
-    marginTop: '0.5rem'
-  }
+    marginTop: '0.5rem',
+  },
 };
 
 export default Login;
