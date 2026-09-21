@@ -12,7 +12,7 @@ const Login = () => {
     setLoading(true);
 
     try {
-      const response = await fetch('http://localhost:8080/Backend/models/login.php', {
+      const response = await fetch('https://gas-db.infinityfree.io/Backend/models/login.php', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
